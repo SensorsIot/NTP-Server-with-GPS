@@ -26,7 +26,7 @@
 
 // Settings
 #define GPS_BAUD         38400        // for a QUESCAN M10050 M10 GNNS receiver in default configuration (38400 baud, 1hz PPS)
-#define CORRECTION_US    700          // this value may need tuning in your own setup
+#define CORRECTION_US    1325         // this value may need tuning in your own setup
 #define NTP_EPOCH_OFFSET 2208988800UL
 #define NTP_PORT         123
 
@@ -201,8 +201,10 @@ void readGPSTime() {
 
     previousSecond = currentSecond;
 
-    // todo: consider if we update every 5 or 10 seconds so we give the system clock a 
-    // chance to incorpoate slews that we had previously asked it to do?
+    // need to allow time for the clock to slew if we have previously asked for an adjustment.
+    if (currentSecond % 5 != 0) {
+      return;
+    }
 
     uint32_t delta = nowMicros - localPPS;
     if (delta > 900000 || delta < 1000) { 
