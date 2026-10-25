@@ -47,7 +47,7 @@ Startup (`setup`): fix the CPU at 240 MHz, wait 10 s for the GNSS module, start 
 - **`CORRECTION_US`** (currently 545 µs) is an empirical, measured constant. Don't change it without new measurements. See the README testing notes.
 - **The hardware is fixed.** The code targets one setup only (WT32-ETH01 with a Quescan M10050 at default settings: 38400 baud, 1 Hz PPS), and the pins and settings are `#define`s at the top of the file. `STATUS_LED_PIN` (GPIO33) is a placeholder because the board has no LED.
 - **The OTA password** (`uploadota`) is hard-coded.
-- **Keep the design doc current.** When V4 behavior changes, update `docs/PPS_Newapproach_V4-design.md` to match, especially its "Known limitations" list. Some items in that list (always claiming sync, stepping when the clock is ahead, no holdover) are already fixed in the current code.
+- **Keep the design doc current.** When V4 behavior changes, update `docs/PPS_Newapproach_V4-design.md` to match, especially its "Known limitations" list.
 
 Open TODOs (README): add a watchdog.
 

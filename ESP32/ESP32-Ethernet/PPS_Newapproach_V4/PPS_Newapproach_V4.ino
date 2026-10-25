@@ -26,9 +26,10 @@
 
 // Settings
 #define GPS_BAUD         38400        // for a QUESCAN M10050 M10 GNNS receiver in default configuration (38400 baud, 1hz PPS)
-#define CORRECTION_US    1325         // this value may need tuning in your own setup
+#define CORRECTION_US    545          // this value may need tuning in your own setup
 #define NTP_EPOCH_OFFSET 2208988800UL
 #define NTP_PORT         123
+#define HOLDOVER_MS      60000        // report unsynchronised (LI=3) if no GNSS sync for this long
 
 // --- GLOBALS ---
 TinyGPSPlus gps;
@@ -37,6 +38,8 @@ volatile uint32_t lastPPSMicros = 0;
 // We use volatile to ensure the LwIP callback sees the latest atomic write
 volatile uint32_t lastSyncSec = 0;
 volatile uint32_t lastSyncFrac = 0;
+volatile uint32_t lastSyncMillis = 0;
+volatile bool everSynced = false;   // false until the system clock has been set from GNSS
 
 // Raw LwIP Control Block
 struct udp_pcb *ntp_pcb;
@@ -83,18 +86,23 @@ void onNtpPacket(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t
   struct timeval tv;
   gettimeofday(&tv, NULL);
 
-  // 2. Validate Packet Size (NTP is 48 bytes)
-  if (p->tot_len >= sizeof(ntp_packet_t)) {
-    // Access payload directly (Zero Copy)
-    ntp_packet_t *pkt = (ntp_packet_t *)p->payload;
-
+  // 2. Validate Packet Size (NTP is 48 bytes), only answer client requests (mode 3) so we
+  // never reply to another server's reply, and stay silent until the clock has been set
+  // from GNSS so we never serve the 1970 boot time.
+  ntp_packet_t *pkt = (ntp_packet_t *)p->payload;
+  if (everSynced && p->tot_len >= sizeof(ntp_packet_t) && (pkt->li_vn_mode & 0x07) == 3) {
     // 3. Prepare Timestamps
     uint32_t s = htonl(tv.tv_sec + NTP_EPOCH_OFFSET);
-    uint32_t f = htonl((uint32_t)((double)tv.tv_usec * 4294.967296)); 
+    uint32_t f = htonl((uint32_t)((double)tv.tv_usec * 4294.967296));
 
     // 4. Update Packet in Place
-    pkt->li_vn_mode = 0x24; // Server, Stratum 1
-    pkt->stratum = 1;
+    // LI=0 while GNSS is fresh, LI=3 (unsynchronised) once we've been in holdover too long.
+    // VN is copied from the request, mode 4 = server.
+    bool stale = (millis() - lastSyncMillis) > HOLDOVER_MS;
+    uint8_t li = stale ? 3 : 0;
+    uint8_t vn = (pkt->li_vn_mode >> 3) & 0x07;
+    pkt->li_vn_mode = (li << 6) | (vn << 3) | 4;
+    pkt->stratum = stale ? 16 : 1;   // 16 = unsynchronised
     pkt->refId = htonl(0x47505300); // "GPS"
     
     // Copy reference time (atomic read from globals)
@@ -188,6 +196,7 @@ void readGPSTime() {
   uint32_t localPPS = lastPPSMicros;
   uint32_t nowMicros = micros();
   static int previousSecond = -1;
+  // static int firstUpdate = 1;
 
   while (gpsSerial.available()) gps.encode(gpsSerial.read());
 
@@ -201,10 +210,10 @@ void readGPSTime() {
 
     previousSecond = currentSecond;
 
-    // need to allow time for the clock to slew if we have previously asked for an adjustment.
-    if (currentSecond % 5 != 0) {
-      return;
-    }
+    // // need to allow time for the clock to slew if we have previously asked for an adjustment.
+    // if (!((currentSecond == 0) || (currentSecond == 30) || (firstUpdate == 1))) {
+    //   return;
+    // }
 
     uint32_t delta = nowMicros - localPPS;
     if (delta > 900000 || delta < 1000) { 
@@ -232,29 +241,27 @@ void readGPSTime() {
     struct timeval now;
     gettimeofday(&now, NULL);
 
-    struct timeval adj;
-    adj.tv_sec  = gpsSecs - now.tv_sec;
-    adj.tv_usec = (delta + CORRECTION_US) - now.tv_usec;
-
-    // ensure that tv_usec is under 1000000
-    adj.tv_sec  += adj.tv_usec / 1000000;
-    adj.tv_usec %= 1000000;
-    if (adj.tv_usec < 0) { 
-      adj.tv_usec += 1000000; adj.tv_sec--; 
-    }
+    // signed offset (GNSS - system clock) in microseconds, positive when the system clock is behind
+    int64_t offset_us = (int64_t)(gpsSecs - now.tv_sec) * 1000000LL
+                      + ((int64_t)delta + CORRECTION_US - now.tv_usec);
 
     // decide if we do a hard set because the difference between GNSS and system
     // clock is too high, or we slew the clock because the difference was low.
-    if (abs(adj.tv_sec) >= 2) {
+    if (llabs(offset_us) >= 1000000) {
        struct timeval tv = { .tv_sec = gpsSecs, .tv_usec = delta + CORRECTION_US };
        tv.tv_sec += tv.tv_usec / 1000000; tv.tv_usec %= 1000000;
        settimeofday(&tv, NULL);
     } else {
+       // |offset| < 1s so it fits in tv_usec; a negative value slews the clock backwards
+       struct timeval adj = { .tv_sec = 0, .tv_usec = (suseconds_t)offset_us };
        adjtime(&adj, NULL);
     }
 
     lastSyncSec  = htonl(gpsSecs + NTP_EPOCH_OFFSET);
     lastSyncFrac = htonl((uint32_t)((double)(delta + CORRECTION_US) * 4294.967296));
+    lastSyncMillis = millis();
+    everSynced = true;
+    // firstUpdate = 0;
   }
 }
 

@@ -32,6 +32,7 @@ The build-time settings are `#define`s at the top of the file:
 | `CORRECTION_US` | Fixed offset in µs added to every sync, tuned by measurement (see [Timing correction](#timing-correction-correction_us)) |
 | `NTP_EPOCH_OFFSET` | Seconds between 1900-01-01 (NTP epoch) and 1970-01-01 (Unix epoch) |
 | `NTP_PORT` | UDP 123 |
+| `HOLDOVER_MS` | How long (60 s) the server keeps reporting itself as synchronized after the last accepted GNSS sync (see [Request handling](#request-handling)) |
 
 ## Architecture overview
 
@@ -43,7 +44,7 @@ flowchart LR
     UART[GPS UART<br/>NMEA] --> GT
     LP --> GT[gpsTask<br/>core 1, prio 2<br/>every 10 ms]
     GT -->|settimeofday / adjtime| CLK[(ESP32<br/>system clock)]
-    GT --> REF[(lastSyncSec<br/>lastSyncFrac)]
+    GT --> REF[(lastSyncSec<br/>lastSyncFrac<br/>lastSyncMillis<br/>everSynced)]
     NET[Ethernet / lwIP] -->|udp_recv callback| CB[onNtpPacket<br/>tcpip thread]
     CLK --> CB
     REF --> CB
@@ -115,21 +116,32 @@ A guard throws away updates where `delta` is outside about **1 ms – 900 ms**:
 
 The status LED toggles, so it blinks at 0.5 Hz while syncs are being accepted. The GPS date and time go into a `struct tm` and `mktime()` converts it to Unix seconds. This works because the ESP32's default time zone is UTC, so `mktime` effectively acts as `timegm`.
 
-The target is `gpsSecs` seconds plus `delta + CORRECTION_US` microseconds. The code compares it with the current system clock to get an adjustment `adj` (seconds and microseconds, normalized so that `0 ≤ tv_usec < 1 000 000`).
+The target is `gpsSecs` seconds plus `delta + CORRECTION_US` microseconds. The code reads the system clock with `gettimeofday()` and works out a single signed offset in microseconds:
+
+```cpp
+int64_t offset_us = (int64_t)(gpsSecs - now.tv_sec) * 1000000LL
+                  + ((int64_t)delta + CORRECTION_US - now.tv_usec);
+```
+
+`offset_us` is GNSS time minus system time. It is positive when the system clock is behind and negative when it is ahead.
 
 ### 6. Slew or step
 
 ```cpp
-if (abs(adj.tv_sec) >= 1)  settimeofday(...);   // step: large error, e.g. first sync
-else                       adjtime(&adj, NULL); // slew: small error, no time jump
+if (llabs(offset_us) >= 1000000) settimeofday(...);   // step: error of 1 s or more, e.g. first sync
+else                             adjtime(&adj, NULL); // slew: adj.tv_usec = offset_us, adj.tv_sec = 0
 ```
 
 - A **step** (`settimeofday`) jumps the clock straight to the target. This is what happens at first sync, when the clock is still near 1970.
-- A **slew** (`adjtime`) asks the kernel to speed up or slow down the clock slightly until the error is gone. Time never jumps and never runs backwards, so NTP clients see smooth time and low jitter.
+- A **slew** (`adjtime`) asks the C library to run the clock slightly fast (positive offset) or slightly slow (negative offset) until the error is gone. Because `|offset_us| < 1 s`, it fits in `tv_usec` with `tv_sec = 0`. Time never jumps and never runs backwards, so NTP clients see smooth time and low jitter.
 
-### 7. Publish the reference timestamp
+The same threshold applies in both directions: a clock that is ahead is slewed back just like one that is behind.
 
-`lastSyncSec` and `lastSyncFrac` are stored already in NTP format and network byte order. The NTP callback can then copy them into replies without converting.
+### 7. Publish the sync state
+
+- `lastSyncSec` and `lastSyncFrac` hold the reference timestamp, stored already in NTP format and network byte order. The NTP callback can then copy them into replies without converting.
+- `lastSyncMillis` records `millis()` at this sync. The NTP callback uses it to decide whether GNSS has been lost for too long.
+- `everSynced` is set to `true`. Until then the NTP callback doesn't answer any request.
 
 ## NTP server (`onNtpPacket`)
 
@@ -150,22 +162,28 @@ UNLOCK_TCPIP_CORE();
 ### Request handling
 
 1. **Timestamp first.** `gettimeofday()` is the first thing the callback does, before any validation.
-2. **Check the size.** Anything shorter than 48 bytes (`sizeof(ntp_packet_t)`) is ignored.
-3. **Edit the packet in place (zero copy).** The received `pbuf` payload is cast to `ntp_packet_t` and overwritten:
+2. **Decide whether to answer.** The packet is dropped without a reply unless all of these hold:
+   - `everSynced` is true, so the server never hands out the 1970 boot time;
+   - it is at least 48 bytes (`sizeof(ntp_packet_t)`);
+   - its mode is 3 (client), so the server never answers another server's reply.
+3. **Check freshness.** The reply counts as *stale* when `millis() - lastSyncMillis > HOLDOVER_MS`, that is, when no GNSS sync has been accepted for more than 60 s. Unsigned subtraction keeps this correct when `millis()` wraps.
+4. **Edit the packet in place (zero copy).** The received `pbuf` payload is cast to `ntp_packet_t` and overwritten:
 
    | Field | Value |
    | --- | --- |
-   | `li_vn_mode` | `0x24`: leap indicator 0, version 4, mode 4 (server) |
-   | `stratum` | 1 (primary reference) |
+   | `li_vn_mode` | Leap indicator 0 when fresh or 3 (unsynchronized) when stale, version copied from the request, mode 4 (server) |
+   | `stratum` | 1 (primary reference) when fresh, 16 (unsynchronized) when stale |
    | `refId` | `"GPS\0"` |
    | `refTm` | last sync time from `lastSyncSec` / `lastSyncFrac` |
    | `origTm` | the client's transmit timestamp, copied from `txTm` |
    | `rxTm`, `txTm` | the timestamp from step 1 |
 
    The fraction field is `tv_usec × 2³² / 10⁶` (`4294.967296`).
-4. **Reflect.** The same `pbuf` goes back to the sender with `udp_sendto`, then `pbuf_free` releases it.
+5. **Reflect.** The same `pbuf` goes back to the sender with `udp_sendto`, then `pbuf_free` releases it.
 
 Setting `rxTm` and `txTm` to the same value assumes the processing time is negligible, which is reasonable because the callback does almost no work.
+
+A stale server keeps answering. It still serves its free-running clock, but LI=3 and stratum 16 tell clients not to trust it. Clients such as chrony and ntpd will then ignore it. As soon as a new sync is accepted, replies go back to LI=0 and stratum 1.
 
 ## Timing correction (`CORRECTION_US`)
 
@@ -187,21 +205,22 @@ ArduinoOTA runs from `loop()` with hostname `gpsclock`. When an update starts, t
 | --- | --- | --- |
 | `lastPPSMicros` | `PPS_ISR` | `gpsTask` |
 | `lastSyncSec`, `lastSyncFrac` | `gpsTask` | `onNtpPacket` |
+| `lastSyncMillis`, `everSynced` | `gpsTask` | `onNtpPacket` |
 | System clock | `gpsTask` (`settimeofday`/`adjtime`) | `onNtpPacket` (`gettimeofday`) |
 
-Each variable is a single aligned 32-bit word, so each read or write is atomic on the ESP32. `volatile` stops the compiler from caching them. There are no locks. The worst case is a reply whose `refTm` mixes the seconds of one sync with the fraction of another. Clients don't use `refTm` to calculate offsets, so this is harmless in practice.
+Each variable is a single aligned word (32-bit, or a `bool`), so each read or write is atomic on the ESP32. `volatile` stops the compiler from caching them. There are no locks. The worst case is a reply whose `refTm` mixes the seconds of one sync with the fraction of another. Clients don't use `refTm` to calculate offsets, so this is harmless in practice.
 
 ## Known limitations and observations
 
 These come from reading the code, not from testing.
 
-- **The server always claims to be synchronized.** Replies always carry stratum 1 and leap indicator 0, even before the first GPS sync or after losing GPS. Clients have no way to tell that the server has drifted.
-- **Some header fields are echoed back from the request.** `poll`, `precision`, `rootDelay` and `rootDispersion` are left as the client sent them instead of being set by the server.
-- **Only clock-behind errors are slewed.** After normalization `adj.tv_usec` is always non-negative, so if the system clock is *ahead* of GPS by any amount (even 1 µs), `adj.tv_sec` becomes −1 and the code steps the clock instead of slewing. In practice the clock is slewed when it is behind and stepped when it is ahead. A check on the total offset (e.g. `|adj.tv_sec × 10⁶ + adj.tv_usec| ≥ 10⁶`) would slew in both directions.
+- **Some header fields are echoed back from the request.** `poll`, `precision`, `rootDelay` and `rootDispersion` are left as the client sent them instead of being set by the server. Root dispersion in particular doesn't grow during holdover, so for the first 60 s after GNSS is lost, clients can't see that the clock is getting less accurate.
+- **A new slew is requested every second.** `adjtime` is called on every accepted sync (the earlier "only adjust every N seconds" gate is commented out). Each call replaces any adjustment still in progress, so a correction that takes longer than a second to slew in is never completed as asked. Instead it is re-measured and re-requested the next second.
 - **Comment and code disagree on the lower guard.** The comment in the delta guard says "< 10ms", but the code uses `delta < 1000` (1 ms).
 - **Possible stale date at midnight.** The date comes from the most recent RMC sentence. If a GGA sentence for 00:00:00 is decoded before the RMC for the new day, the date can be a day behind for that one sync. `gps.date.isValid()` is also not checked.
 - **Variable processing time before `gettimeofday`.** The time spent draining and parsing the UART between `nowMicros` and `gettimeofday()` varies with how many bytes are waiting. `CORRECTION_US` only removes the average, so the rest shows up as jitter.
-- **No holdover or fix-quality checks.** Any valid NMEA time paired with a PPS edge is trusted. Satellite count and fix status are not checked.
+- **No fix-quality checks.** Any valid NMEA time paired with a PPS edge is trusted. Satellite count and fix status are not checked. The holdover limit only reacts when syncs *stop*, not when they come from a poor fix.
+- **Holdover is a fixed timeout.** The server is reported as synchronized for the full `HOLDOVER_MS` after the last sync, however much the clock actually drifts in that time.
 - **Hard-coded OTA password.** The OTA password (`uploadota`) is in the source.
 - **No watchdog** (listed as a TODO in the README).
 - **Unused leftovers.** The commented-out `firstUpdate` logic (only adjusting at :00/:30) is from an earlier approach. `credentials.h` sits in the sketch folder but is not included.
