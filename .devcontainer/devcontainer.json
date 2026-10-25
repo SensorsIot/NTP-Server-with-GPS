@@ -1,0 +1,43 @@
+// For format details, see https://aka.ms/devcontainer.json
+{
+	"name": "Arduino dev",
+	"build": {
+		"dockerfile": "Dockerfile",
+		"context": ".",
+		"args": {
+			"USER_NAME": "vscode",
+			"VARIANT": "debian-12",
+			"ARDUINO_CLI_VERSION": "1.4.1"
+		 }
+	},
+
+	"customizations": {
+		"vscode": {
+			// Set *default* container specific settings.json values on container create.
+			"settings": {
+				"arduino.path": "/opt/arduino",
+				"arduino.logLevel": "verbose"
+			},
+			// Add the IDs of extensions you want installed when the container is created.
+			"extensions": [
+				"vsciot-vscode.vscode-arduino",
+				"yzhang.markdown-all-in-one"
+			]
+		}
+	},
+
+	"mounts": [
+		"source=/dev,target=/dev,type=bind"
+	],
+	
+	"runArgs": [
+		"--privileged",
+		"--cap-add=SYS_PTRACE",
+		"--security-opt",
+		"seccomp=unconfined"
+	],
+
+	"initializeCommand": "DIALOUT_GID=$(getent group dialout 2>/dev/null | cut -d ':' -f 3); if [ -z \"$DIALOUT_GID\" ]; then DIALOUT_GID=20; fi; printf \"DIALOUT_GID=%s\\n\" \"$DIALOUT_GID\" > ${localWorkspaceFolder}/.devcontainer/envfile",
+
+	"remoteUser": "vscode"
+}
