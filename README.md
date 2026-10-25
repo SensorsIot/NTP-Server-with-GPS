@@ -5,9 +5,19 @@
 Take a look at ESP32/ESP32-Ethernet/PPS_Newapproach_V4/PPS_Newapproach_V4.ino. This is rewritten code that was assisted by Gemini 3 Pro (it required a lot of prompting direction, checking, and testing).
 
 * Low latency (responds quickly to NTP requests). In my testing delay is < 1ms.
-* Low jitter (requests to slew the clock where reasonable instead of making hard time jumps). In my testing jitter is < 0.2ms.
+* Low jitter (serves time from the ESP32's microsecond timer, anchored at each PPS edge and corrected for the crystal's measured frequency error, so the clock never jumps or slews). With the earlier slewing version, jitter in my testing was < 0.2ms.
 * Enables Arduino OTA
 * Configuration is only for a WT32-ETH01 module with a Quescan M10050 M10 GNSS receiver in default settings (38400 baud, 1hz PPS).
+
+### Flashing over OTA
+
+mDNS is disabled to keep the network stack quiet, so the board won't show up as a network port in the Arduino IDE. To flash the firmware you'll need to export the compiled binary (Sketch > Export Compiled Binary) and run `espota` yourself from the command line:
+
+```
+%LOCALAPPDATA%\Arduino15\packages\esp32\hardware\esp32\[version]\tools>espota.exe -i [hardware ip] -p 3232 -f [path]\PPS_Newapproach_V4.ino.bin -a "[password]"
+```
+
+The password is the one set with `ArduinoOTA.setPassword()` in the sketch.
 
 Todos:
 * Set up a watchdog

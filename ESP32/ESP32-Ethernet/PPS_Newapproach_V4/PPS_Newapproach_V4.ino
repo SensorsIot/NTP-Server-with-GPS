@@ -27,7 +27,7 @@
 
 // Settings
 #define GPS_BAUD         38400        // for a QUESCAN M10050 M10 GNNS receiver in default configuration (38400 baud, 1hz PPS)
-#define CORRECTION_US    345          // this value may need tuning in your own setup
+#define CORRECTION_US    0          // this value may need tuning in your own setup
 #define NTP_EPOCH_OFFSET 2208988800UL
 #define NTP_PORT         123
 #define HOLDOVER_MS      60000        // report unsynchronised (LI=3) if no GNSS sync for this long
