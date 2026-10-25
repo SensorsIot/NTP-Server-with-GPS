@@ -28,7 +28,7 @@ Everything is in one file, `PPS_Newapproach_V4.ino`. Four execution contexts sha
 | Interrupt (GPIO2 rising) | `PPS_ISR` | Saves `micros()` into `lastPPSMicros` |
 | FreeRTOS task `GPS` (core 1, prio 2, every 10 ms) | `gpsTask` → `readGPSTime` | Parses NMEA with TinyGPSPlus, pairs the time with the latest PPS edge, then slews (`adjtime`) the system clock if the offset is under 1 s or steps it (`settimeofday`) otherwise. Publishes `lastSyncSec`/`lastSyncFrac` (NTP format, network byte order), `lastSyncMillis` and `everSynced` |
 | lwIP tcpip thread | `onNtpPacket` | Raw lwIP `udp_recv` callback. Calls `gettimeofday` first, then rewrites the request `pbuf` in place and sends it back with `udp_sendto` |
-| Arduino `loop()` | `loop` | `ArduinoOTA.handle()` every 100 ms (hostname `gpsclock`) |
+| Arduino `loop()` | `loop` | `ArduinoOTA.handle()` every 100 ms (hostname `gpsclock`, mDNS disabled to keep the tcpip thread quiet, so upload by IP) |
 
 NTP reply behavior:
 - Only answers packets that are at least 48 bytes, in mode 3 (client), and arrive after the first GNSS sync (`everSynced`).
@@ -44,7 +44,7 @@ Startup (`setup`): fix the CPU at 240 MHz, wait 10 s for the GNSS module, start 
 - **Shared state is lock-free.** It works only because each global is a single aligned 32-bit word. Keep new shared state the same way, or add explicit synchronization.
 - **Prefer slewing to stepping.** Avoid changes that make the clock jump or run backwards during normal operation.
 - **The PPS/NMEA pairing guard** (`1 ms < delta < 900 ms`) assumes NMEA for second N arrives a few hundred ms after PPS edge N.
-- **`CORRECTION_US`** (currently 545 µs) is an empirical, measured constant. Don't change it without new measurements. See the README testing notes.
+- **`CORRECTION_US`** (currently 545 µs) is an empirical, measured constant. Don't change it without new measurements. The procedure is in the "Tuning" section of the design doc.
 - **The hardware is fixed.** The code targets one setup only (WT32-ETH01 with a Quescan M10050 at default settings: 38400 baud, 1 Hz PPS), and the pins and settings are `#define`s at the top of the file. `STATUS_LED_PIN` (GPIO33) is a placeholder because the board has no LED.
 - **The OTA password** (`uploadota`) is hard-coded.
 - **Keep the design doc current.** When V4 behavior changes, update `docs/PPS_Newapproach_V4-design.md` to match, especially its "Known limitations" list.
@@ -55,8 +55,14 @@ Open TODOs (README): add a watchdog.
 
 There is no test suite. Testing is done on hardware by comparing against a trusted NTP reference (see the README).
 
-The dev container ships `arduino-cli` without the ESP32 core or libraries. To compile V4 you need the `esp32:esp32` core and the `TinyGPSPlus` library. `ETH.h`, `ArduinoOTA` and `ESPmDNS` come with the core. Once they are installed, a likely compile command is the following (untested here):
+The dev container image ships `arduino-cli` without the ESP32 core or libraries, so install them once per container. V4 has been compiled with esp32 core 3.3.12 and TinyGPSPlus 1.0.3. `ETH.h`, `ArduinoOTA` and `ESPmDNS` come with the core.
 
 ```sh
-arduino-cli compile --fqbn esp32:esp32:wt32-eth01 ESP32/ESP32-Ethernet/PPS_Newapproach_V4
+URL=https://espressif.github.io/arduino-esp32/package_esp32_index.json
+arduino-cli core update-index --additional-urls $URL
+arduino-cli core install esp32:esp32 --additional-urls $URL
+arduino-cli lib install TinyGPSPlus
+arduino-cli compile --fqbn esp32:esp32:wt32-eth01 --warnings all ESP32/ESP32-Ethernet/PPS_Newapproach_V4
 ```
+
+The only expected warning is an implicit fall-through inside TinyGPSPlus.

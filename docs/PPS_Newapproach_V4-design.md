@@ -67,7 +67,7 @@ The clock is read and written only through the standard POSIX calls. The NTP pat
 2. **Wait 10 s** so the GNSS module can power up before the UART is opened.
 3. **Start GPS input.** Open UART1 at `GPS_BAUD` and attach `PPS_ISR` to the rising edge of GPIO2.
 4. **`initNetwork()`.** Power-cycle the LAN8720 through `ETH_POWER_PIN`, start `ETH`, and wait up to 30 s for a DHCP address.
-5. **`initOTA()`.** Start ArduinoOTA with hostname `gpsclock` (advertised over mDNS).
+5. **`initOTA()`.** Start ArduinoOTA with hostname `gpsclock`. mDNS is disabled, so upload by IP.
 6. **`initRawNTP()`.** Register the raw lwIP UDP callback on port 123 (see below).
 7. **Start `gpsTask`,** pinned to core 1 at priority 2, with a 4 KB stack.
 
@@ -84,7 +84,7 @@ uint32_t localPPS  = lastPPSMicros;
 uint32_t nowMicros = micros();
 ```
 
-These two values are read before the UART is drained, so the PPS-to-now interval is measured as close to the start of the call as possible.
+`localPPS` is captured before the UART is drained, so a PPS edge that fires during parsing can't replace the edge for the second being decoded. `nowMicros` is used only for the pairing check in step 4. The offset itself is measured later, in step 5.
 
 ### 2. Feed NMEA into TinyGPSPlus
 
@@ -116,12 +116,15 @@ A guard throws away updates where `delta` is outside about **1 ms – 900 ms**:
 
 The status LED toggles, so it blinks at 0.5 Hz while syncs are being accepted. The GPS date and time go into a `struct tm` and `mktime()` converts it to Unix seconds. This works because the ESP32's default time zone is UTC, so `mktime` effectively acts as `timegm`.
 
-The target is `gpsSecs` seconds plus `delta + CORRECTION_US` microseconds. The code reads the system clock with `gettimeofday()` and works out a single signed offset in microseconds:
+To compare GNSS time with the system clock, the code needs both clocks read at the same instant. It reads `micros()`, `gettimeofday()`, then `micros()` again back to back, and uses the midpoint of the two `micros()` reads. If the pair is more than 20 µs apart (the task was preempted in between), it retries, up to 5 times:
 
 ```cpp
+uint32_t sinceEdge = (m0 + (m1 - m0) / 2) - localPPS;   // µs since PPS edge N when 'now' was read
 int64_t offset_us = (int64_t)(gpsSecs - now.tv_sec) * 1000000LL
-                  + ((int64_t)delta + CORRECTION_US - now.tv_usec);
+                  + ((int64_t)sinceEdge + CORRECTION_US - now.tv_usec);
 ```
+
+The target is `gpsSecs` seconds plus `sinceEdge + CORRECTION_US` microseconds, taken at the moment `now` was read. Because both readings come from the same moment, the time spent draining the UART, parsing NMEA and in `mktime()` doesn't end up in the offset. Before this change, `delta` (from step 1) was compared with a `gettimeofday()` taken after parsing. That gap varied from second to second and went straight into the clock as jitter.
 
 `offset_us` is GNSS time minus system time. It is positive when the system clock is behind and negative when it is ahead.
 
@@ -176,12 +179,11 @@ UNLOCK_TCPIP_CORE();
    | `refId` | `"GPS\0"` |
    | `refTm` | last sync time from `lastSyncSec` / `lastSyncFrac` |
    | `origTm` | the client's transmit timestamp, copied from `txTm` |
-   | `rxTm`, `txTm` | the timestamp from step 1 |
+   | `rxTm` | the timestamp from step 1 |
 
-   The fraction field is `tv_usec × 2³² / 10⁶` (`4294.967296`).
-5. **Reflect.** The same `pbuf` goes back to the sender with `udp_sendto`, then `pbuf_free` releases it.
-
-Setting `rxTm` and `txTm` to the same value assumes the processing time is negligible, which is reasonable because the callback does almost no work.
+   The fraction field is `tv_usec × 2³² / 10⁶`, computed by `usecToNtpFrac()` with a 64-bit integer multiply and shift (`usec × 281474977 >> 16`, within about 1 ns of exact). The ESP32's FPU is single-precision only, so `double` maths would be emulated in software.
+5. **Transmit timestamp last.** `gettimeofday()` is called again and written to `txTm` just before sending. The client computes delay as `(T4 − T1) − (T3 − T2)`, so the server's processing time is subtracted instead of being counted as network delay.
+6. **Reflect.** The same `pbuf` goes back to the sender with `udp_sendto`, then `pbuf_free` releases it.
 
 A stale server keeps answering. It still serves its free-running clock, but LI=3 and stratum 16 tell clients not to trust it. Clients such as chrony and ntpd will then ignore it. As soon as a new sync is accepted, replies go back to LI=0 and stratum 1.
 
@@ -190,14 +192,34 @@ A stale server keeps answering. It still serves its free-running clock, but LI=3
 `CORRECTION_US` (currently 545 µs) is an empirical constant added to `delta` on every sync. It absorbs fixed latencies that the code doesn't measure, mainly:
 
 - interrupt latency between the PPS edge and `micros()` in the ISR;
-- the time between capturing `nowMicros` and calling `gettimeofday()` in `readGPSTime` (UART draining, NMEA parsing, `mktime`);
+- the time from the Ethernet frame arriving to the `gettimeofday()` call in `onNtpPacket`, and from the final `gettimeofday()` to the reply leaving;
 - any fixed offset in the receiver's PPS output or the measurement setup.
 
-It is tuned by comparing the server against a trusted reference (see the testing notes in the [README](../README.md)), and will probably need re-tuning for a different board, receiver, or library version.
+It is tuned by measuring the server over NTP against a trusted reference (see [Tuning](#tuning)). Because it is measured the way clients see the server, it also cancels any fixed bias in the network path. It will probably need re-tuning for a different board, receiver, cable, switch, or core/library version.
+
+The 545 µs value was tuned before the back-to-back clock sampling in `readGPSTime` was added. At that time it also absorbed the average UART parsing time, so it needs re-tuning and will probably come down by a few hundred µs.
+
+### Tuning
+
+1. **Set up a reference.** Use a machine disciplined by its own GNSS PPS, such as the Raspberry Pi + chrony setup in [`Raspberry Pi/`](../Raspberry%20Pi/), on the same switch as the ESP32. An internet NTP source is only accurate to about a millisecond, which is too coarse.
+2. **Monitor the ESP32 from the reference.** Add this to the reference's `chrony.conf`:
+
+   ```
+   server <esp32-ip> iburst noselect minpoll 2 maxpoll 2
+   ```
+
+   `noselect` lets chrony measure the ESP32 without letting it steer the reference's clock. Polling every 4 s fills chrony's 64-sample window in about 4 minutes.
+3. **Measure.** After each upload, wait about 10 minutes for the initial step and slews to settle. Then read the ESP32's `Offset` and `Std Dev` from `chronyc sourcestats`, a few times a minute or two apart.
+4. **Adjust.** In chrony, a positive offset means the reference is ahead of the ESP32, so the ESP32 is behind.
+   - Offset of +X µs: increase `CORRECTION_US` by X.
+   - Offset of −X µs: decrease it by X.
+
+   If the next measurement's offset grows instead of shrinking, the sign is the wrong way round: undo the change and go the other way.
+5. **Stop when the offset is smaller than the `Std Dev`.** Below that you're tuning to noise. For a longer average that ignores outliers, add `log measurements` to `chrony.conf` and take the median offset from `/var/log/chrony/measurements.log` over 30 minutes or more.
 
 ## OTA updates
 
-ArduinoOTA runs from `loop()` with hostname `gpsclock`. When an update starts, the PPS interrupt is detached so the ISR (in IRAM) can't interfere with flash writes. If an update fails, the device restarts.
+ArduinoOTA runs from `loop()` with hostname `gpsclock`. Its mDNS responder is turned off (`setMdnsEnabled(false)`), because mDNS traffic is handled in the same lwIP tcpip thread as the NTP callback and could delay it. Uploads must therefore use the device's IP address. When an update starts, the PPS interrupt is detached so the ISR (in IRAM) can't interfere with flash writes. If an update fails, the device restarts.
 
 ## Shared state and concurrency
 
@@ -218,7 +240,8 @@ These come from reading the code, not from testing.
 - **A new slew is requested every second.** `adjtime` is called on every accepted sync (the earlier "only adjust every N seconds" gate is commented out). Each call replaces any adjustment still in progress, so a correction that takes longer than a second to slew in is never completed as asked. Instead it is re-measured and re-requested the next second.
 - **Comment and code disagree on the lower guard.** The comment in the delta guard says "< 10ms", but the code uses `delta < 1000` (1 ms).
 - **Possible stale date at midnight.** The date comes from the most recent RMC sentence. If a GGA sentence for 00:00:00 is decoded before the RMC for the new day, the date can be a day behind for that one sync. `gps.date.isValid()` is also not checked.
-- **Variable processing time before `gettimeofday`.** The time spent draining and parsing the UART between `nowMicros` and `gettimeofday()` varies with how many bytes are waiting. `CORRECTION_US` only removes the average, so the rest shows up as jitter.
+- **Phase-only correction.** Each sync corrects the clock's offset but not its rate. The crystal's frequency error (typically ±10–20 ppm) therefore builds up to roughly 10–20 µs between corrections, a sawtooth pattern.
+- **PPS interrupt latency.** The PPS edge is timestamped by a level-1 Arduino `attachInterrupt` handler, which other level-1 interrupts on the same core (such as the GPS UART) can delay.
 - **No fix-quality checks.** Any valid NMEA time paired with a PPS edge is trusted. Satellite count and fix status are not checked. The holdover limit only reacts when syncs *stop*, not when they come from a poor fix.
 - **Holdover is a fixed timeout.** The server is reported as synchronized for the full `HOLDOVER_MS` after the last sync, however much the clock actually drifts in that time.
 - **Hard-coded OTA password.** The OTA password (`uploadota`) is in the source.

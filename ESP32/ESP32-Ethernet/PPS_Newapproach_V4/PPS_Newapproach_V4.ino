@@ -71,6 +71,12 @@ void fatalError(const char* msg) {
   ESP.restart();
 }
 
+// --- HELPERS ---
+// usec * 2^32 / 10^6 without floating point (the ESP32 FPU is single precision, so double maths is emulated)
+static inline uint32_t usecToNtpFrac(uint32_t usec) {
+  return (uint32_t)(((uint64_t)usec * 281474977ULL) >> 16);
+}
+
 // --- ISR ---
 void IRAM_ATTR PPS_ISR() {
   lastPPSMicros = micros();
@@ -91,11 +97,7 @@ void onNtpPacket(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t
   // from GNSS so we never serve the 1970 boot time.
   ntp_packet_t *pkt = (ntp_packet_t *)p->payload;
   if (everSynced && p->tot_len >= sizeof(ntp_packet_t) && (pkt->li_vn_mode & 0x07) == 3) {
-    // 3. Prepare Timestamps
-    uint32_t s = htonl(tv.tv_sec + NTP_EPOCH_OFFSET);
-    uint32_t f = htonl((uint32_t)((double)tv.tv_usec * 4294.967296));
-
-    // 4. Update Packet in Place
+    // 3. Update Packet in Place
     // LI=0 while GNSS is fresh, LI=3 (unsynchronised) once we've been in holdover too long.
     // VN is copied from the request, mode 4 = server.
     bool stale = (millis() - lastSyncMillis) > HOLDOVER_MS;
@@ -113,9 +115,16 @@ void onNtpPacket(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t
     pkt->origTm_s = pkt->txTm_s; 
     pkt->origTm_f = pkt->txTm_f;
     
-    // RX and TX times are effectively "now"
-    pkt->rxTm_s = s; pkt->rxTm_f = f;
-    pkt->txTm_s = s; pkt->txTm_f = f;
+    // RX = the timestamp taken on arrival
+    pkt->rxTm_s = htonl(tv.tv_sec + NTP_EPOCH_OFFSET);
+    pkt->rxTm_f = htonl(usecToNtpFrac(tv.tv_usec));
+
+    // 4. TX = read the clock again as late as possible so our processing time is
+    // reported to the client instead of being counted as network delay
+    struct timeval txv;
+    gettimeofday(&txv, NULL);
+    pkt->txTm_s = htonl(txv.tv_sec + NTP_EPOCH_OFFSET);
+    pkt->txTm_f = htonl(usecToNtpFrac(txv.tv_usec));
 
     // 5. Send Response (Reflect the buffer back)
     udp_sendto(pcb, p, addr, port);
@@ -174,6 +183,8 @@ void initRawNTP() {
 void initOTA() {
   ArduinoOTA.setHostname("gpsclock");
   ArduinoOTA.setPassword("uploadota");
+  // no mDNS responder: it adds traffic to the lwIP tcpip thread that the NTP callback runs in. Upload by IP.
+  ArduinoOTA.setMdnsEnabled(false);
   ArduinoOTA.onStart([]() {
     Serial.println("Start updating...");
     // Stop interrupts to prevent crashes during flash write
@@ -238,17 +249,27 @@ void readGPSTime() {
     t.tm_sec  = gps.time.second();
     
     time_t gpsSecs = mktime(&t);
+
+    // sample micros() and the system clock back to back so the time spent draining the UART,
+    // parsing NMEA and in mktime() never leaks into the offset. Retry if we were preempted in between.
     struct timeval now;
-    gettimeofday(&now, NULL);
+    uint32_t m0, m1;
+    for (int i = 0; i < 5; i++) {
+      m0 = micros();
+      gettimeofday(&now, NULL);
+      m1 = micros();
+      if (m1 - m0 < 20) break;
+    }
+    uint32_t sinceEdge = (m0 + (m1 - m0) / 2) - localPPS;   // us since PPS edge N when 'now' was read
 
     // signed offset (GNSS - system clock) in microseconds, positive when the system clock is behind
     int64_t offset_us = (int64_t)(gpsSecs - now.tv_sec) * 1000000LL
-                      + ((int64_t)delta + CORRECTION_US - now.tv_usec);
+                      + ((int64_t)sinceEdge + CORRECTION_US - now.tv_usec);
 
     // decide if we do a hard set because the difference between GNSS and system
     // clock is too high, or we slew the clock because the difference was low.
     if (llabs(offset_us) >= 1000000) {
-       struct timeval tv = { .tv_sec = gpsSecs, .tv_usec = delta + CORRECTION_US };
+       struct timeval tv = { .tv_sec = gpsSecs, .tv_usec = (suseconds_t)(sinceEdge + CORRECTION_US) };
        tv.tv_sec += tv.tv_usec / 1000000; tv.tv_usec %= 1000000;
        settimeofday(&tv, NULL);
     } else {
@@ -258,7 +279,7 @@ void readGPSTime() {
     }
 
     lastSyncSec  = htonl(gpsSecs + NTP_EPOCH_OFFSET);
-    lastSyncFrac = htonl((uint32_t)((double)(delta + CORRECTION_US) * 4294.967296));
+    lastSyncFrac = htonl(usecToNtpFrac(delta + CORRECTION_US));
     lastSyncMillis = millis();
     everSynced = true;
     // firstUpdate = 0;
