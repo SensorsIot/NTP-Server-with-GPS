@@ -1,6 +1,7 @@
 #include <ETH.h>
 #include <TinyGPSPlus.h>
 #include <time.h>
+#include <esp_timer.h>
 #include <lwip/def.h>
 #include <lwip/udp.h> 
 #include <freertos/FreeRTOS.h>
@@ -26,20 +27,28 @@
 
 // Settings
 #define GPS_BAUD         38400        // for a QUESCAN M10050 M10 GNNS receiver in default configuration (38400 baud, 1hz PPS)
-#define CORRECTION_US    545          // this value may need tuning in your own setup
+#define CORRECTION_US    345          // this value may need tuning in your own setup
 #define NTP_EPOCH_OFFSET 2208988800UL
 #define NTP_PORT         123
 #define HOLDOVER_MS      60000        // report unsynchronised (LI=3) if no GNSS sync for this long
+#define MAX_PPM          100          // reject PPS edges whose spacing implies a clock error larger than this
+#define RATE_SHIFT       4            // frequency estimate averages over about 2^RATE_SHIFT syncs
 
 // --- GLOBALS ---
 TinyGPSPlus gps;
 HardwareSerial gpsSerial(1);
-volatile uint32_t lastPPSMicros = 0;
-// We use volatile to ensure the LwIP callback sees the latest atomic write
-volatile uint32_t lastSyncSec = 0;
-volatile uint32_t lastSyncFrac = 0;
-volatile uint32_t lastSyncMillis = 0;
-volatile bool everSynced = false;   // false until the system clock has been set from GNSS
+volatile uint32_t lastPPSMicros = 0;   // low 32 bits of esp_timer at the latest PPS edge (one word, so the write is atomic)
+
+// The served time is computed from esp_timer, anchored at the last accepted PPS edge and corrected
+// for esp_timer's frequency error. gpsTask writes it and the NTP callback reads it, both under tsMux.
+typedef struct {
+  int64_t  edgeUs;    // esp_timer time of the anchor PPS edge, minus CORRECTION_US
+  uint32_t ntpSec;    // NTP seconds that start at that edge
+  int64_t  rateQ32;   // esp_timer frequency error as a fraction x 2^32, positive when it runs fast
+  bool     valid;     // false until two GNSS syncs agree, so we never serve the boot time or a glitched edge
+} timescale_t;
+timescale_t timescale = {0, 0, 0, false};
+portMUX_TYPE tsMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Raw LwIP Control Block
 struct udp_pcb *ntp_pcb;
@@ -77,9 +86,17 @@ static inline uint32_t usecToNtpFrac(uint32_t usec) {
   return (uint32_t)(((uint64_t)usec * 281474977ULL) >> 16);
 }
 
+// convert an esp_timer reading into NTP seconds and fraction using a copy of the timescale
+static inline void toNtp(const timescale_t &ts, int64_t t, uint32_t &sec, uint32_t &frac) {
+  int64_t elapsed = t - ts.edgeUs;              // esp_timer us since the anchor edge
+  elapsed -= (elapsed * ts.rateQ32) >> 32;      // remove esp_timer's frequency error
+  sec  = ts.ntpSec + (uint32_t)(elapsed / 1000000);
+  frac = usecToNtpFrac((uint32_t)(elapsed % 1000000));
+}
+
 // --- ISR ---
 void IRAM_ATTR PPS_ISR() {
-  lastPPSMicros = micros();
+  lastPPSMicros = (uint32_t)esp_timer_get_time();
 }
 
 // --- RAW LwIP CALLBACK (Running in TCP/IP Thread) ---
@@ -89,42 +106,48 @@ void onNtpPacket(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t
   if (p == NULL) return;
 
   // 1. TIMESTAMP IMMEDIATELY (Critical Path)
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
+  int64_t rxUs = esp_timer_get_time();
+
+  // take a consistent copy of the timescale (the lock is only held for the copy)
+  timescale_t ts;
+  portENTER_CRITICAL(&tsMux);
+  ts = timescale;
+  portEXIT_CRITICAL(&tsMux);
 
   // 2. Validate Packet Size (NTP is 48 bytes), only answer client requests (mode 3) so we
-  // never reply to another server's reply, and stay silent until the clock has been set
-  // from GNSS so we never serve the 1970 boot time.
+  // never reply to another server's reply, and stay silent until the timescale has been set
+  // from GNSS so we never serve the boot time.
   ntp_packet_t *pkt = (ntp_packet_t *)p->payload;
-  if (everSynced && p->tot_len >= sizeof(ntp_packet_t) && (pkt->li_vn_mode & 0x07) == 3) {
+  if (ts.valid && p->tot_len >= sizeof(ntp_packet_t) && (pkt->li_vn_mode & 0x07) == 3) {
     // 3. Update Packet in Place
     // LI=0 while GNSS is fresh, LI=3 (unsynchronised) once we've been in holdover too long.
     // VN is copied from the request, mode 4 = server.
-    bool stale = (millis() - lastSyncMillis) > HOLDOVER_MS;
+    bool stale = (rxUs - ts.edgeUs) > (int64_t)HOLDOVER_MS * 1000;
     uint8_t li = stale ? 3 : 0;
     uint8_t vn = (pkt->li_vn_mode >> 3) & 0x07;
     pkt->li_vn_mode = (li << 6) | (vn << 3) | 4;
     pkt->stratum = stale ? 16 : 1;   // 16 = unsynchronised
     pkt->refId = htonl(0x47505300); // "GPS"
     
-    // Copy reference time (atomic read from globals)
-    pkt->refTm_s = lastSyncSec;
-    pkt->refTm_f = lastSyncFrac;
-    
+    // Reference time = the PPS edge the timescale is anchored to
+    pkt->refTm_s = htonl(ts.ntpSec);
+    pkt->refTm_f = 0;
+
     // Originate = Client's Transmit Time
-    pkt->origTm_s = pkt->txTm_s; 
+    pkt->origTm_s = pkt->txTm_s;
     pkt->origTm_f = pkt->txTm_f;
-    
+
     // RX = the timestamp taken on arrival
-    pkt->rxTm_s = htonl(tv.tv_sec + NTP_EPOCH_OFFSET);
-    pkt->rxTm_f = htonl(usecToNtpFrac(tv.tv_usec));
+    uint32_t s, f;
+    toNtp(ts, rxUs, s, f);
+    pkt->rxTm_s = htonl(s);
+    pkt->rxTm_f = htonl(f);
 
     // 4. TX = read the clock again as late as possible so our processing time is
     // reported to the client instead of being counted as network delay
-    struct timeval txv;
-    gettimeofday(&txv, NULL);
-    pkt->txTm_s = htonl(txv.tv_sec + NTP_EPOCH_OFFSET);
-    pkt->txTm_f = htonl(usecToNtpFrac(txv.tv_usec));
+    toNtp(ts, esp_timer_get_time(), s, f);
+    pkt->txTm_s = htonl(s);
+    pkt->txTm_f = htonl(f);
 
     // 5. Send Response (Reflect the buffer back)
     udp_sendto(pcb, p, addr, port);
@@ -203,11 +226,47 @@ void initOTA() {
 }
 
 // --- TASKS ---
+// Anchor the timescale at PPS edge 'edgeUs' (full esp_timer time), which starts NTP second 'ntpSec',
+// and learn esp_timer's frequency error from the spacing of successive edges.
+void updateTimescale(uint32_t ntpSec, int64_t edgeUs) {
+  static int64_t prevEdgeUs = 0;
+  static uint32_t prevSec = 0;
+  static int64_t rateQ32 = 0;
+  static bool haveRate = false;
+  static int rejects = 0;
+
+  if (prevSec != 0) {
+    int64_t secs = (int32_t)(ntpSec - prevSec);                 // seconds since the previous anchor
+    int64_t gainUs = (edgeUs - prevEdgeUs) - secs * 1000000;     // how far esp_timer ran ahead over them
+    if (secs <= 0 || llabs(gainUs) > secs * MAX_PPM) {
+      // the edge spacing doesn't fit a real crystal: a glitch on the PPS line, or the NMEA paired with
+      // the wrong edge or date. Keep serving from the previous anchor, unless this keeps happening, in
+      // which case it was the previous anchor that was wrong.
+      if (++rejects < 3) return;
+    } else {
+      int64_t sample = gainUs * 4294967296LL / (secs * 1000000);
+      rateQ32 = haveRate ? rateQ32 + ((sample - rateQ32) >> RATE_SHIFT) : sample;
+      haveRate = true;
+    }
+  }
+  rejects = 0;
+  prevEdgeUs = edgeUs;
+  prevSec = ntpSec;
+
+  portENTER_CRITICAL(&tsMux);
+  timescale.edgeUs = edgeUs - CORRECTION_US;
+  timescale.ntpSec = ntpSec;
+  timescale.rateQ32 = rateQ32;
+  timescale.valid = haveRate;
+  portEXIT_CRITICAL(&tsMux);
+}
+
 void readGPSTime() {
+  // snapshot the latest PPS edge and the time now before draining the UART, so an edge that
+  // fires while we parse can't replace the one for the second being decoded
   uint32_t localPPS = lastPPSMicros;
-  uint32_t nowMicros = micros();
+  int64_t nowUs = esp_timer_get_time();
   static int previousSecond = -1;
-  // static int firstUpdate = 1;
 
   while (gpsSerial.available()) gps.encode(gpsSerial.read());
 
@@ -221,12 +280,7 @@ void readGPSTime() {
 
     previousSecond = currentSecond;
 
-    // // need to allow time for the clock to slew if we have previously asked for an adjustment.
-    // if (!((currentSecond == 0) || (currentSecond == 30) || (firstUpdate == 1))) {
-    //   return;
-    // }
-
-    uint32_t delta = nowMicros - localPPS;
+    uint32_t delta = (uint32_t)nowUs - localPPS;
     if (delta > 900000 || delta < 1000) { 
       // "one-second" guard: GPS sentences usually arrive 200-500ms AFTER the PPS pulse.
       // If microsecondsSincePulse is very large (e.g., > 900ms), we are likely looking at 
@@ -250,39 +304,8 @@ void readGPSTime() {
     
     time_t gpsSecs = mktime(&t);
 
-    // sample micros() and the system clock back to back so the time spent draining the UART,
-    // parsing NMEA and in mktime() never leaks into the offset. Retry if we were preempted in between.
-    struct timeval now;
-    uint32_t m0, m1;
-    for (int i = 0; i < 5; i++) {
-      m0 = micros();
-      gettimeofday(&now, NULL);
-      m1 = micros();
-      if (m1 - m0 < 20) break;
-    }
-    uint32_t sinceEdge = (m0 + (m1 - m0) / 2) - localPPS;   // us since PPS edge N when 'now' was read
-
-    // signed offset (GNSS - system clock) in microseconds, positive when the system clock is behind
-    int64_t offset_us = (int64_t)(gpsSecs - now.tv_sec) * 1000000LL
-                      + ((int64_t)sinceEdge + CORRECTION_US - now.tv_usec);
-
-    // decide if we do a hard set because the difference between GNSS and system
-    // clock is too high, or we slew the clock because the difference was low.
-    if (llabs(offset_us) >= 1000000) {
-       struct timeval tv = { .tv_sec = gpsSecs, .tv_usec = (suseconds_t)(sinceEdge + CORRECTION_US) };
-       tv.tv_sec += tv.tv_usec / 1000000; tv.tv_usec %= 1000000;
-       settimeofday(&tv, NULL);
-    } else {
-       // |offset| < 1s so it fits in tv_usec; a negative value slews the clock backwards
-       struct timeval adj = { .tv_sec = 0, .tv_usec = (suseconds_t)offset_us };
-       adjtime(&adj, NULL);
-    }
-
-    lastSyncSec  = htonl(gpsSecs + NTP_EPOCH_OFFSET);
-    lastSyncFrac = htonl(usecToNtpFrac(delta + CORRECTION_US));
-    lastSyncMillis = millis();
-    everSynced = true;
-    // firstUpdate = 0;
+    // edge N happened delta us before nowUs (localPPS is the low 32 bits of its esp_timer time)
+    updateTimescale(gpsSecs + NTP_EPOCH_OFFSET, nowUs - delta);
   }
 }
 

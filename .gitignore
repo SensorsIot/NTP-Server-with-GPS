@@ -28,6 +28,7 @@ Thumbs.db
 
 # Ignore compiled libraries
 libraries/*/build/
+ESP32/ESP32-Ethernet/PPS_Newapproach_V4/build
 
 # Ignore board-specific files
 hardware/*/bootloaders/*.o
