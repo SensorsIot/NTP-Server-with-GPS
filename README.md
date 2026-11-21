@@ -2,12 +2,15 @@
 
 ## Changes from forked source
 
-Take a look at ESP32/ESP32-Ethernet/PPS_Newapproach_V4/PPS_Newapproach_V4.ino. This is rewritten code that was assisted by Gemini 3 Pro (it required a lot of prompting direction, checking, and testing).
+Take a look at [`ESP32/ESP32-Ethernet/PPS_Newapproach_V4/PPS_Newapproach_V4.ino`](ESP32/ESP32-Ethernet/PPS_Newapproach_V4/PPS_Newapproach_V4.ino) (and the detailed design notes in [`docs/PPS_Newapproach_V4-design.md`](docs/PPS_Newapproach_V4-design.md)). This is rewritten code assisted by Gemini 4 Neon and Claude Opus 5.5 with testing by myself.
 
-* Low latency (responds quickly to NTP requests). In my testing delay is < 1ms.
-* Low jitter (serves time from the ESP32's microsecond timer, anchored at each PPS edge and corrected for the crystal's measured frequency error, so the clock never jumps or slews). With the earlier slewing version, jitter in my testing was < 0.2ms.
-* Enables Arduino OTA
-* Configuration is only for a WT32-ETH01 module with a Quescan M10050 M10 GNSS receiver in default settings (38400 baud, 1hz PPS).
+* **Low latency:** Uses lwIP's raw UDP callback directly in the `tcpip` thread, taking the receive timestamp on arrival and the transmit timestamp just before sending. In testing with OPNsense, delay is < 1 ms (~0.68 ms).
+* **Low jitter & hardware PPS capture:** Serves time from the ESP32's free-running microsecond timer (`esp_timer`), anchored at each PPS rising edge latched in hardware via the ESP32's 80 MHz MCPWM capture peripheral (removing PPS ISR latency jitter) and corrected for the crystal's measured frequency error, so the clock never jumps or slews. In testing with OPNsense, jitter is ~0.07 ms.
+* **Stratum 1 protocol & holdover behavior:** Sets NTP server header fields (`precision`, `rootDelay`, and holdover-scaled `rootDispersion` growing at 15 ppm per RFC 5905), guards `pbuf` lengths, stays silent until two GNSS syncs agree, and transitions to LI=3 / stratum 16 after 60 s without a valid sync.
+* **GNSS fix & edge validation:** Parses date, time, and fix status (`'A'`/`'V'`) atomically from RMC (`$GNRMC`/`$GPRMC`), requires valid date/time and at least 4 satellites (from GGA), rejects outlier PPS edges against the rate-predicted spacing, and requires corroboration before trusting a re-seeded anchor.
+* **u-blox M10 startup config (RAM-only):** Sends a non-destructive `UBX-CFG-VALSET` at boot to set Stationary dynamic mode, disable unused NMEA sentences (keeping only RMC and GGA), and output 1 Hz / 100 ms PPS pulses only when GNSS-locked.
+* **Watchdog & Arduino OTA:** Subscribes the GPS task to the ESP-IDF task watchdog, and enables Arduino OTA (pausing NTP replies, PPS capture, and the GPS task watchdog during flash writes).
+* **Fixed hardware target:** Configured specifically for a WT32-ETH01 module with a Quescan M10050 (u-blox M10) GNSS receiver at 38400 baud and 1 Hz PPS.
 
 ### Flashing over OTA
 
@@ -18,9 +21,6 @@ mDNS is disabled to keep the network stack quiet, so the board won't show up as 
 ```
 
 The password is the one set with `ArduinoOTA.setPassword()` in the sketch.
-
-Todos:
-* Set up a watchdog
 
 ## Original readme
 
