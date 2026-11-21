@@ -45,13 +45,13 @@ The build-time settings are `#define`s at the top of the file:
 
 ## Architecture overview
 
-Four execution contexts share two pieces of state: `lastPPSMicros`, and the `timescale` struct protected by the `tsMux` spinlock.
+Four execution contexts share two main pieces of state: the MCPWM capture timestamps (`lastPPSCap` / `lastPPSRoughUs`), and the `timescale` struct protected by the `tsMux` spinlock.
 
 ```mermaid
 flowchart LR
-    PPS[PPS pin<br/>rising edge] -->|ISR| LP[(lastPPSMicros)]
-    UART[GPS UART<br/>NMEA] --> GT
-    LP --> GT[gpsTask<br/>core 1, prio 2<br/>every 10 ms]
+    PPS[PPS pin<br/>rising edge] -->|MCPWM hw capture<br/>80 MHz| LP[(lastPPSCap<br/>lastPPSRoughUs)]
+    UART[GPS UART<br/>NMEA / UBX] --> GT
+    LP --> GT[gpsTask<br/>core 1, prio 2<br/>every 10 ms, TWDT]
     GT -->|updateTimescale| TS[(timescale<br/>edge, second, rate<br/>under tsMux)]
     TIMER[(esp_timer)] --> CB
     NET[Ethernet / lwIP] -->|udp_recv callback| CB[onNtpPacket<br/>tcpip thread]
@@ -62,8 +62,8 @@ flowchart LR
 
 | Context | Function | Job |
 | --- | --- | --- |
-| Interrupt | `PPS_ISR` | Saves the low 32 bits of `esp_timer_get_time()` at each PPS rising edge |
-| FreeRTOS task `GPS` | `gpsTask` → `readGPSTime` → `updateTimescale` | Parses NMEA, works out which UTC second the latest PPS edge started, checks the edge is plausible, updates the frequency estimate and publishes the new anchor |
+| Interrupt | `onPpsCapture` / `onSoftCapture` | Saves the 80 MHz MCPWM hardware-latched PPS counter value (`lastPPSCap`) and a coarse `esp_timer` stamp (`lastPPSRoughUs`), plus software-catch values for clock correlation |
+| FreeRTOS task `GPS` | `gpsTask` → `readGPSTime` → `updateTimescale` | Feeds the task watchdog, parses NMEA RMC/GGA, maps the hardware PPS count into `esp_timer` microseconds via `snapshotClocks()`, validates the edge, updates the frequency estimate and publishes the new anchor |
 | lwIP tcpip thread | `onNtpPacket` | Reads `esp_timer`, converts it to NTP time with `toNtp()`, and replies in place |
 | Arduino `loop()` | `loop` | Handles OTA every 100 ms |
 
@@ -79,11 +79,11 @@ Here `edgeUs` is the `esp_timer` time of the last accepted PPS edge (shifted by 
 
 1. **Fix the CPU at 240 MHz** so frequency scaling can't change timing behavior.
 2. **Wait 10 s** so the GNSS module can power up before the UART is opened.
-3. **Start GPS input.** Open UART1 at `GPS_BAUD` and attach `PPS_ISR` to the rising edge of GPIO2.
+3. **Start GPS input and hardware PPS capture.** Open UART1 at `GPS_BAUD`, call `initUbloxM10()` to send a RAM-only `UBX-CFG-VALSET` (Stationary dynamic model, keep only RMC + GGA NMEA sentences, and emit 1 Hz / 100 ms TP1 pulses only when GNSS-locked), and call `initPpsCapture()` to configure MCPWM0 channel 0 (rising-edge hardware capture on GPIO2 at 80 MHz) and channel 1 (software-only catch channel for `esp_timer` correlation).
 4. **`initNetwork()`.** Power-cycle the LAN8720 through `ETH_POWER_PIN`, start `ETH`, and wait up to 30 s for a DHCP address.
 5. **`initOTA()`.** Start ArduinoOTA with hostname `gpsclock`. mDNS is disabled, so upload by IP.
 6. **`initRawNTP()`.** Register the raw lwIP UDP callback on port 123 (see below).
-7. **Start `gpsTask`,** pinned to core 1 at priority 2, with a 4 KB stack.
+7. **Start `gpsTask`,** pinned to core 1 at priority 2, with a 4 KB stack; `gpsTask` subscribes itself to the ESP-IDF task watchdog (`esp_task_wdt_add(NULL)`).
 
 If a step fails (PHY start, DHCP timeout, UDP PCB create/bind), `fatalError()` prints a message, waits 2 s, and calls `ESP.restart()`. The device keeps retrying through reboots instead of hanging.
 
@@ -95,12 +95,7 @@ The server stays silent until two consecutive GNSS syncs agree, typically 2–3 
 
 ### 1. Snapshot the timing references first
 
-```cpp
-uint32_t localPPS = lastPPSMicros;
-int64_t  nowUs    = esp_timer_get_time();
-```
-
-These are captured before the UART is drained, so a PPS edge that fires during parsing can't replace the edge for the second being decoded. The ISR stores only the low 32 bits of `esp_timer` (one word, so the write is atomic). `nowUs` is read alongside it so the edge's full 64-bit time can be rebuilt in step 5.
+Before draining the UART, `readGPSTime()` snapshots `havePPSCap`, `lastPPSCap` (the 80 MHz MCPWM hardware-latched rising-edge counter value), `lastPPSRoughUs` (a coarse `esp_timer` stamp taken in `onPpsCapture`), and `preDrainUs = esp_timer_get_time()`. If `lastPPSCap` changed between reads, it re-reads once for a consistent pair. Capturing these before draining the UART prevents a PPS edge that fires during parsing from replacing the edge for the second being decoded.
 
 ### 2. Feed NMEA into TinyGPSPlus and validate the fix
 
@@ -120,14 +115,14 @@ The design depends on how the receiver behaves: the PPS edge marks the exact sta
 
 ```
  PPS edge (second N)                       NMEA "N" parsed here
-      |<---------------- delta ---------------->|
+      |<--------------- deltaUs --------------->|
  -----+------------------------------------------+-----------+---- time
-  lastPPSMicros                                nowUs     next PPS (N+1)
+  lastPPSCap (hw 80 MHz)                    snapshotClocks()  next PPS (N+1)
 ```
 
-`delta = (uint32_t)nowUs - localPPS` is the time elapsed since edge N. The unsigned subtraction stays correct when the 32-bit value wraps.
+Once a valid RMC sentence is decoded, `preDelta = (uint32_t)preDrainUs - localPPSRoughUs` is checked against **1 ms – 900 ms**. Then `snapshotClocks()` brackets a software catch on MCPWM channel 1 (`mcpwm_capture_channel_trigger_soft_catch`) between two `esp_timer_get_time()` reads inside a brief critical section (`capMux`), yielding a correlated `(nowUs, nowCap)` pair within ~1–2 µs.
 
-A guard throws away updates where `delta` is outside about **1 ms – 900 ms**:
+`deltaTicks = nowCap - localPPSCap` is converted to `deltaUs` using `capResHz` (80 MHz, matching `esp_timer`'s APB clock source so there is zero clock-domain drift). Because the 32-bit 80 MHz counter wraps every 53.7 s, `deltaUs` is cross-checked against `roughDelta = (uint32_t)nowUs - localPPSRoughUs` (71.6 min wrap) and rejected if they disagree by more than 5 ms or fall outside **1 ms – 900 ms**:
 
 - `delta > 900 ms`: the PPS stamp is probably from the previous second (a PPS edge was missed, or the NMEA arrived very late).
 - `delta < 1 ms`: the PPS for second N+1 probably fired before the NMEA for second N was parsed, so the pairing would be wrong by one second.
@@ -250,14 +245,15 @@ It is tuned by measuring the server over NTP against a trusted reference (see [T
 
 ## OTA updates
 
-ArduinoOTA runs from `loop()` with hostname `gpsclock`. Its mDNS responder is turned off (`setMdnsEnabled(false)`), because mDNS traffic is handled in the same lwIP tcpip thread as the NTP callback and could delay it. Uploads must therefore use the device's IP address. When an update starts, the PPS interrupt is detached so the ISR (in IRAM) can't interfere with flash writes. If an update fails, the device restarts.
+ArduinoOTA runs from `loop()` with hostname `gpsclock`. Its mDNS responder is turned off (`setMdnsEnabled(false)`), because mDNS traffic is handled in the same lwIP tcpip thread as the NTP callback and could delay it. Uploads must therefore use the device's IP address. When an update starts, `otaInProgress` is set, `timescale.valid` is cleared so NTP replies pause, MCPWM PPS capture is disabled so its ISR can't interfere with flash writes, and `gpsTask` is unsubscribed from the task watchdog so long flash erases don't trigger a reset. If an update fails, the device restarts.
 
 ## Shared state and concurrency
 
 | Variable | Writer | Reader(s) | Protection |
 | --- | --- | --- | --- |
-| `lastPPSMicros` | `PPS_ISR` | `gpsTask` | One aligned 32-bit word, so reads and writes are atomic; `volatile` |
-| `timescale` | `gpsTask` (`updateTimescale`) | `onNtpPacket` | `tsMux` spinlock (`portENTER_CRITICAL`), held only to copy the struct |
+| `lastPPSCap`, `lastPPSRoughUs`, `havePPSCap` | `onPpsCapture` | `gpsTask` | Aligned single-word `volatile`s; `gpsTask` re-reads if `lastPPSCap` changes mid-snapshot |
+| `lastSoftCap`, `softCapDone` | `onSoftCapture` | `gpsTask` (`snapshotClocks`) | Handshake via `softCapDone` around `capMux` critical section |
+| `timescale` | `gpsTask` (`updateTimescale`), `ArduinoOTA.onStart` | `onNtpPacket` | `tsMux` spinlock (`portENTER_CRITICAL`), held only to copy/clear the struct |
 
 `timescale` has 64-bit fields, so unlike the single-word globals it needs a lock to be read consistently. A spinlock works across both cores and is held for well under a microsecond. The NTP callback reads `esp_timer` before taking it, so a brief wait for the lock adds latency but never moves the receive timestamp.
 
@@ -269,9 +265,7 @@ These come from reading the code and a host simulation of the timescale maths, n
 
 - **The ESP32 system clock is never set.** `time()`/`gettimeofday()` report time since boot. Nothing in the sketch uses them, but anything added later that does would get the wrong time.
 - **1 µs resolution.** `esp_timer` counts whole microseconds, so served timestamps are quantized to 1 µs.
-- **PPS interrupt latency.** The PPS edge is timestamped by a level-1 Arduino `attachInterrupt` handler, which other level-1 interrupts on the same core (such as the GPS UART or EMAC) can delay. Delays larger than `MAX_EDGE_JITTER_US + MAX_DRIFT_PPM` (20 µs on a 1 s interval) are rejected once locked, but smaller delays still shift the anchor (and slightly the rate) for one second.
 - **Holdover is a fixed timeout.** The server is reported as synchronized (LI=0, stratum 1) for the full `HOLDOVER_MS` after the last sync, however much the clock actually drifts in that time, although `rootDispersion` grows continuously at `ROOT_DISP_PPM` so clients can see accuracy degrading.
 - **Hard-coded OTA password.** The OTA password (`uploadota`) is in the source.
-- **No watchdog** (listed as a TODO in the README).
 - **Unused file.** `credentials.h` sits in the sketch folder but is not included.
 - **Year 2036.** NTP seconds are 32-bit (`ntpSec`), so they wrap in February 2036 (NTP era 1). Most clients handle this, but it is worth knowing.

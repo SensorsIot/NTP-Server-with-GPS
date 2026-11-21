@@ -2,6 +2,8 @@
 #include <TinyGPSPlus.h>
 #include <time.h>
 #include <esp_timer.h>
+#include <esp_task_wdt.h>
+#include <driver/mcpwm_cap.h>
 #include <lwip/def.h>
 #include <lwip/udp.h> 
 #include <freertos/FreeRTOS.h>
@@ -46,7 +48,23 @@ TinyGPSPlus gps;
 TinyGPSCustom gnrmcStatus(gps, "GNRMC", 2);  // RMC fix status ('A' = active, 'V' = void)
 TinyGPSCustom gprmcStatus(gps, "GPRMC", 2);
 HardwareSerial gpsSerial(1);
-volatile uint32_t lastPPSMicros = 0;   // low 32 bits of esp_timer at the latest PPS edge (one word, so the write is atomic)
+
+// MCPWM hardware capture state: channel 0 latches PPS rising edges in hardware at 80 MHz APB
+// (12.5 ns, zero ISR latency jitter); channel 1 is software-triggered to correlate MCPWM ticks
+// with esp_timer's microsecond timebase.
+mcpwm_cap_timer_handle_t   ppsCapTimer = NULL;
+mcpwm_cap_channel_handle_t ppsCapChan  = NULL;
+mcpwm_cap_channel_handle_t softCapChan = NULL;
+uint32_t capResHz = 80000000;          // actual MCPWM capture tick rate (queried at init)
+volatile uint32_t lastPPSCap     = 0;  // hardware-latched MCPWM count at the latest PPS edge
+volatile uint32_t lastPPSRoughUs = 0;  // coarse esp_timer time of that edge (guards 53.7 s cap wrap)
+volatile bool     havePPSCap     = false;
+volatile uint32_t lastSoftCap    = 0;  // MCPWM count latched by software catch
+volatile bool     softCapDone    = false;
+portMUX_TYPE      capMux         = portMUX_INITIALIZER_UNLOCKED;
+
+TaskHandle_t  gpsTaskHandle = NULL;
+volatile bool otaInProgress = false;
 
 // The served time is computed from esp_timer, anchored at the last accepted PPS edge and corrected
 // for esp_timer's frequency error. gpsTask writes it and the NTP callback reads it, both under tsMux.
@@ -114,9 +132,47 @@ static inline void toNtp(const timescale_t &ts, int64_t t, uint32_t &sec, uint32
   frac = usecToNtpFrac((uint32_t)(elapsed % 1000000));
 }
 
-// --- ISR ---
-void IRAM_ATTR PPS_ISR() {
-  lastPPSMicros = (uint32_t)esp_timer_get_time();
+// --- MCPWM CAPTURE ISRs ---
+static bool IRAM_ATTR onPpsCapture(mcpwm_cap_channel_handle_t cap_chan,
+                                   const mcpwm_capture_event_data_t *edata,
+                                   void *user_ctx) {
+  lastPPSCap = edata->cap_value;
+  lastPPSRoughUs = (uint32_t)esp_timer_get_time();
+  havePPSCap = true;
+  return false;
+}
+
+static bool IRAM_ATTR onSoftCapture(mcpwm_cap_channel_handle_t cap_chan,
+                                    const mcpwm_capture_event_data_t *edata,
+                                    void *user_ctx) {
+  lastSoftCap = edata->cap_value;
+  softCapDone = true;
+  return false;
+}
+
+// Correlate esp_timer and the MCPWM capture counter within a short critical section so a
+// hardware-latched PPS count can be mapped into esp_timer's microsecond timebase.
+static bool snapshotClocks(int64_t &nowUs, uint32_t &nowCap) {
+  for (int attempt = 0; attempt < 4; attempt++) {
+    softCapDone = false;
+    portENTER_CRITICAL(&capMux);
+    int64_t t1 = esp_timer_get_time();
+    esp_err_t err = mcpwm_capture_channel_trigger_soft_catch(softCapChan);
+    int64_t t2 = esp_timer_get_time();
+    portEXIT_CRITICAL(&capMux);
+    if (err != ESP_OK) return false;
+
+    int spins = 0;
+    while (!softCapDone && spins < 1000) {
+      spins++;
+    }
+    if (softCapDone && (t2 - t1) <= 6) {
+      nowUs = t1 + (t2 - t1) / 2;
+      nowCap = lastSoftCap;
+      return true;
+    }
+  }
+  return false;
 }
 
 // --- RAW LwIP CALLBACK (Running in TCP/IP Thread) ---
@@ -189,6 +245,134 @@ void onNtpPacket(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t
 }
 
 // --- INIT ---
+void initPpsCapture() {
+  mcpwm_capture_timer_config_t timerCfg = {};
+  timerCfg.group_id = 0;
+  timerCfg.clk_src = MCPWM_CAPTURE_CLK_SRC_DEFAULT;
+  if (mcpwm_new_capture_timer(&timerCfg, &ppsCapTimer) != ESP_OK) {
+    fatalError("Could not create MCPWM capture timer");
+  }
+  if (mcpwm_capture_timer_get_resolution(ppsCapTimer, &capResHz) != ESP_OK || capResHz == 0) {
+    fatalError("Could not query MCPWM capture resolution");
+  }
+
+  // Channel 0: hardware rising-edge capture on PPS_PIN (GPIO2)
+  mcpwm_capture_channel_config_t ppsChanCfg = {};
+  ppsChanCfg.gpio_num = PPS_PIN;
+  ppsChanCfg.prescale = 1;
+  ppsChanCfg.flags.pos_edge = true;
+  if (mcpwm_new_capture_channel(ppsCapTimer, &ppsChanCfg, &ppsCapChan) != ESP_OK) {
+    fatalError("Could not create MCPWM PPS capture channel");
+  }
+  mcpwm_capture_event_callbacks_t ppsCbs = {};
+  ppsCbs.on_cap = onPpsCapture;
+  if (mcpwm_capture_channel_register_event_callbacks(ppsCapChan, &ppsCbs, NULL) != ESP_OK) {
+    fatalError("Could not register MCPWM PPS callback");
+  }
+  if (mcpwm_capture_channel_enable(ppsCapChan) != ESP_OK) {
+    fatalError("Could not enable MCPWM PPS channel");
+  }
+
+  // Channel 1: software-only capture channel (no GPIO) to correlate MCPWM ticks with esp_timer
+  mcpwm_capture_channel_config_t softChanCfg = {};
+  softChanCfg.gpio_num = -1;
+  softChanCfg.prescale = 1;
+  softChanCfg.flags.pos_edge = true;
+  if (mcpwm_new_capture_channel(ppsCapTimer, &softChanCfg, &softCapChan) != ESP_OK) {
+    fatalError("Could not create MCPWM soft capture channel");
+  }
+  mcpwm_capture_event_callbacks_t softCbs = {};
+  softCbs.on_cap = onSoftCapture;
+  if (mcpwm_capture_channel_register_event_callbacks(softCapChan, &softCbs, NULL) != ESP_OK) {
+    fatalError("Could not register MCPWM soft callback");
+  }
+  if (mcpwm_capture_channel_enable(softCapChan) != ESP_OK) {
+    fatalError("Could not enable MCPWM soft channel");
+  }
+
+  if (mcpwm_capture_timer_enable(ppsCapTimer) != ESP_OK ||
+      mcpwm_capture_timer_start(ppsCapTimer) != ESP_OK) {
+    fatalError("Could not start MCPWM capture timer");
+  }
+}
+
+// Configure a u-blox M10 over UART1 (RAM layer only, so settings are non-destructive and
+// reset cleanly on power-cycle): Stationary mode, keep only RMC + GGA NMEA sentences, and
+// emit 1 Hz / 100 ms PPS on TP1 only when locked to GNSS time.
+void initUbloxM10() {
+  uint8_t buf[128];
+  size_t len = 0;
+
+  // UBX header: sync (0xB5, 0x62), class CFG (0x06), id VALSET (0x8A), length placeholder
+  buf[len++] = 0xB5;
+  buf[len++] = 0x62;
+  buf[len++] = 0x06;
+  buf[len++] = 0x8A;
+  buf[len++] = 0x00;
+  buf[len++] = 0x00;
+  // CFG-VALSET header: version 0, layers = RAM only (0x01), reserved (2 bytes)
+  buf[len++] = 0x00;
+  buf[len++] = 0x01;
+  buf[len++] = 0x00;
+  buf[len++] = 0x00;
+
+  auto addKey = [&](uint32_t key) {
+    buf[len++] = (uint8_t)(key & 0xFF);
+    buf[len++] = (uint8_t)((key >> 8) & 0xFF);
+    buf[len++] = (uint8_t)((key >> 16) & 0xFF);
+    buf[len++] = (uint8_t)((key >> 24) & 0xFF);
+  };
+  auto addU1 = [&](uint32_t key, uint8_t val) {
+    addKey(key);
+    buf[len++] = val;
+  };
+  auto addU4 = [&](uint32_t key, uint32_t val) {
+    addKey(key);
+    buf[len++] = (uint8_t)(val & 0xFF);
+    buf[len++] = (uint8_t)((val >> 8) & 0xFF);
+    buf[len++] = (uint8_t)((val >> 16) & 0xFF);
+    buf[len++] = (uint8_t)((val >> 24) & 0xFF);
+  };
+
+  // Dynamic model: 2 = Stationary (tighter timing for a fixed antenna)
+  addU1(0x20110021, 2);       // CFG-NAVSPG-DYNMODEL
+
+  // NMEA output on UART1: keep RMC (atomic time/date/status) and GGA (satellites), disable the rest
+  addU1(0x209100AC, 1);       // CFG-MSGOUT-NMEA_ID_RMC_UART1
+  addU1(0x209100BB, 1);       // CFG-MSGOUT-NMEA_ID_GGA_UART1
+  addU1(0x209100CA, 0);       // CFG-MSGOUT-NMEA_ID_GLL_UART1
+  addU1(0x209100C0, 0);       // CFG-MSGOUT-NMEA_ID_GSA_UART1
+  addU1(0x209100C5, 0);       // CFG-MSGOUT-NMEA_ID_GSV_UART1
+  addU1(0x209100B1, 0);       // CFG-MSGOUT-NMEA_ID_VTG_UART1
+
+  // Time pulse TP1: 1 Hz / 100 ms pulse when GNSS-locked, 0 us (no pulse) when unlocked
+  addU1(0x10050007, 1);       // CFG-TP-TP1_ENA
+  addU1(0x10050008, 1);       // CFG-TP-SYNC_GNSS_TP1
+  addU1(0x10050009, 1);       // CFG-TP-USE_LOCKED_TP1
+  addU1(0x20050023, 0);       // CFG-TP-PULSE_DEF (0 = PERIOD)
+  addU1(0x20050030, 1);       // CFG-TP-PULSE_LENGTH_DEF (1 = LENGTH in us)
+  addU4(0x40050002, 1000000); // CFG-TP-PERIOD_TP1 (1 s)
+  addU4(0x40050003, 1000000); // CFG-TP-PERIOD_LOCK_TP1 (1 s)
+  addU4(0x40050004, 0);       // CFG-TP-LEN_TP1 (0 us = off when unlocked)
+  addU4(0x40050005, 100000);  // CFG-TP-LEN_LOCK_TP1 (100 ms when locked)
+
+  uint16_t payloadLen = (uint16_t)(len - 6);
+  buf[4] = (uint8_t)(payloadLen & 0xFF);
+  buf[5] = (uint8_t)((payloadLen >> 8) & 0xFF);
+
+  uint8_t ckA = 0, ckB = 0;
+  for (size_t i = 2; i < len; i++) {
+    ckA += buf[i];
+    ckB += ckA;
+  }
+  buf[len++] = ckA;
+  buf[len++] = ckB;
+
+  gpsSerial.write(buf, len);
+  gpsSerial.flush();
+  delay(50);
+}
+
 void initNetwork() {
   // power cycle ethernet
   pinMode(ETH_POWER_PIN, OUTPUT);
@@ -241,8 +425,17 @@ void initOTA() {
   ArduinoOTA.setMdnsEnabled(false);
   ArduinoOTA.onStart([]() {
     Serial.println("Start updating...");
-    // Stop interrupts to prevent crashes during flash write
-    detachInterrupt(digitalPinToInterrupt(PPS_PIN));
+    // Stop serving NTP time, halt GPS updates, and disable PPS capture + WDT during flash writes
+    otaInProgress = true;
+    portENTER_CRITICAL(&tsMux);
+    timescale.valid = false;
+    portEXIT_CRITICAL(&tsMux);
+    if (ppsCapChan) {
+      mcpwm_capture_channel_disable(ppsCapChan);
+    }
+    if (gpsTaskHandle) {
+      esp_task_wdt_delete(gpsTaskHandle);
+    }
   });
   ArduinoOTA.onEnd([]() { 
     Serial.println("\nEnd"); 
@@ -315,10 +508,17 @@ void updateTimescale(uint32_t ntpSec, int64_t edgeUs) {
 }
 
 void readGPSTime() {
-  // snapshot the latest PPS edge and the time now before draining the UART, so an edge that
+  // snapshot the latest hardware-latched PPS edge before draining the UART, so an edge that
   // fires while we parse can't replace the one for the second being decoded
-  uint32_t localPPS = lastPPSMicros;
-  int64_t nowUs = esp_timer_get_time();
+  bool localHavePPS = havePPSCap;
+  uint32_t localPPSCap = lastPPSCap;
+  uint32_t localPPSRoughUs = lastPPSRoughUs;
+  if (lastPPSCap != localPPSCap) {
+    localPPSCap = lastPPSCap;
+    localPPSRoughUs = lastPPSRoughUs;
+    localHavePPS = havePPSCap;
+  }
+  int64_t preDrainUs = esp_timer_get_time();
   static int previousSecond = -1;
 
   while (gpsSerial.available()) gps.encode(gpsSerial.read());
@@ -336,7 +536,7 @@ void readGPSTime() {
     rmcActive = rmcActive || (gprmcStatus.value()[0] == 'A');
   }
 
-  if (!rmcUpdated || !rmcActive) {
+  if (!rmcUpdated || !rmcActive || !localHavePPS) {
     return;
   }
 
@@ -355,13 +555,28 @@ void readGPSTime() {
   }
   previousSecond = currentSecond;
 
-  uint32_t delta = (uint32_t)nowUs - localPPS;
-  if (delta > 900000 || delta < 1000) {
+  uint32_t preDelta = (uint32_t)preDrainUs - localPPSRoughUs;
+  if (preDelta > 900000 || preDelta < 1000) {
     // "one-second" guard: GPS sentences usually arrive 50-500ms AFTER the PPS pulse.
     // If delta is very large (> 900ms), we are likely looking at an old PPS pulse from
     // the PREVIOUS second. If it's very small (< 1ms), the PPS for the NEXT second might
     // have just fired before we parsed the data for the current second. Skip processing
     // outside this window.
+    return;
+  }
+
+  int64_t nowUs = 0;
+  uint32_t nowCap = 0;
+  if (!snapshotClocks(nowUs, nowCap)) {
+    return;
+  }
+
+  // Convert the hardware-latched 80 MHz tick delta into microseconds and cross-check against
+  // roughDelta (71.6 min wrap) so the 53.7 s 32-bit capture counter wrap can never fool us.
+  uint32_t roughDelta = (uint32_t)nowUs - localPPSRoughUs;
+  uint32_t deltaTicks = nowCap - localPPSCap;
+  uint32_t deltaUs = (uint32_t)(((uint64_t)deltaTicks * 1000000ULL + capResHz / 2) / capResHz);
+  if (deltaUs > 900000 || deltaUs < 1000 || llabs((int64_t)deltaUs - (int64_t)roughDelta) > 5000) {
     return;
   }
 
@@ -381,15 +596,19 @@ void readGPSTime() {
     return;
   }
 
-  // edge N happened delta us before nowUs (localPPS is the low 32 bits of its esp_timer time)
-  updateTimescale(gpsSecs + NTP_EPOCH_OFFSET, nowUs - delta);
+  // edge N happened deltaUs before nowUs (measured from the hardware-latched MCPWM capture count)
+  updateTimescale(gpsSecs + NTP_EPOCH_OFFSET, nowUs - deltaUs);
 }
 
-void gpsTask(void *p) { 
-  while(1) { 
-    readGPSTime(); 
-    vTaskDelay(pdMS_TO_TICKS(10)); 
-  } 
+void gpsTask(void *p) {
+  esp_task_wdt_add(NULL);
+  while (1) {
+    if (!otaInProgress) {
+      esp_task_wdt_reset();
+      readGPSTime();
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
 }
 
 void setup() {
@@ -403,8 +622,8 @@ void setup() {
   Serial.println("----- start: gps init -----");
   pinMode(STATUS_LED_PIN, OUTPUT);
   gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-  pinMode(PPS_PIN, INPUT);
-  attachInterrupt(digitalPinToInterrupt(PPS_PIN), PPS_ISR, RISING);
+  initUbloxM10();
+  initPpsCapture();
   
   Serial.println("----- start: network init -----");
   initNetwork();
@@ -416,7 +635,7 @@ void setup() {
   initRawNTP();
 
   Serial.println("----- start: start gps task -----");
-  xTaskCreatePinnedToCore(gpsTask, "GPS", 4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(gpsTask, "GPS", 4096, NULL, 2, &gpsTaskHandle, 1);
 
   Serial.println("----- start: complete -----");
 }
