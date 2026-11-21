@@ -32,6 +32,10 @@
 #define NTP_PORT         123
 #define HOLDOVER_MS      60000        // report unsynchronised (LI=3) if no GNSS sync for this long
 #define MAX_PPM            100        // reject PPS edges whose spacing implies a clock error larger than this
+#define MAX_EDGE_JITTER_US 15         // max allowed PPS residual vs rate-predicted edge (base, in us)
+#define MAX_DRIFT_PPM      5          // additional allowed residual per second of interval (covers temp drift in holdover)
+#define MIN_SATS           4          // minimum satellites in use (from GGA) required to accept a GNSS sync
+#define MIN_VALID_YEAR     2025       // reject uninitialized/RTC-default GNSS dates before this year
 #define RATE_SHIFT         4          // frequency estimate averages over about 2^RATE_SHIFT syncs
 #define NTP_PRECISION      (-20)      // log2 seconds (~0.95 us), matching esp_timer's 1 us resolution
 #define ROOT_DISP_BASE_US  50         // baseline root dispersion in us when freshly synced
@@ -39,6 +43,8 @@
 
 // --- GLOBALS ---
 TinyGPSPlus gps;
+TinyGPSCustom gnrmcStatus(gps, "GNRMC", 2);  // RMC fix status ('A' = active, 'V' = void)
+TinyGPSCustom gprmcStatus(gps, "GPRMC", 2);
 HardwareSerial gpsSerial(1);
 volatile uint32_t lastPPSMicros = 0;   // low 32 bits of esp_timer at the latest PPS edge (one word, so the write is atomic)
 
@@ -260,20 +266,42 @@ void updateTimescale(uint32_t ntpSec, int64_t edgeUs) {
   static bool haveRate = false;
   static int rejects = 0;
 
-  if (prevSec != 0) {
-    int64_t secs = (int32_t)(ntpSec - prevSec);                 // seconds since the previous anchor
-    int64_t gainUs = (edgeUs - prevEdgeUs) - secs * 1000000;     // how far esp_timer ran ahead over them
-    if (secs <= 0 || llabs(gainUs) > secs * MAX_PPM) {
-      // the edge spacing doesn't fit a real crystal: a glitch on the PPS line, or the NMEA paired with
-      // the wrong edge or date. Keep serving from the previous anchor, unless this keeps happening, in
-      // which case it was the previous anchor that was wrong.
-      if (++rejects < 3) return;
-    } else {
-      int64_t sample = gainUs * 4294967296LL / (secs * 1000000);
-      rateQ32 = haveRate ? rateQ32 + ((sample - rateQ32) >> RATE_SHIFT) : sample;
-      haveRate = true;
+  if (prevSec == 0) {
+    // First sync: store as candidate anchor and wait for a second sync to corroborate it.
+    prevEdgeUs = edgeUs;
+    prevSec = ntpSec;
+    return;
+  }
+
+  int64_t secs = (int32_t)(ntpSec - prevSec);                 // seconds since the previous anchor
+  int64_t gainUs = (edgeUs - prevEdgeUs) - secs * 1000000LL;  // how far esp_timer ran ahead over them
+  bool bad = (secs <= 0 || llabs(gainUs) > secs * MAX_PPM);
+  if (!bad && haveRate) {
+    // Once frequency error is known, reject edges that deviate too far from the predicted spacing
+    // (e.g. a delayed PPS ISR) instead of baking that jitter into the next second's anchor.
+    int64_t expectedGainUs = ((secs * 1000000LL) * rateQ32 + (1LL << 31)) >> 32;
+    int64_t maxResidualUs = MAX_EDGE_JITTER_US + secs * MAX_DRIFT_PPM;
+    if (llabs(gainUs - expectedGainUs) > maxResidualUs) {
+      bad = true;
     }
   }
+
+  if (bad) {
+    // Keep serving from the previous anchor. If 3 syncs in a row fail, assume the previous
+    // anchor (or learned rate) was bad and re-seed without publishing yet, so the next sync
+    // must corroborate the new candidate before clients see it.
+    if (++rejects >= 3) {
+      rejects = 0;
+      prevEdgeUs = edgeUs;
+      prevSec = ntpSec;
+      haveRate = false;
+    }
+    return;
+  }
+
+  int64_t sample = gainUs * 4294967296LL / (secs * 1000000LL);
+  rateQ32 = haveRate ? rateQ32 + ((sample - rateQ32) >> RATE_SHIFT) : sample;
+  haveRate = true;
   rejects = 0;
   prevEdgeUs = edgeUs;
   prevSec = ntpSec;
@@ -282,7 +310,7 @@ void updateTimescale(uint32_t ntpSec, int64_t edgeUs) {
   timescale.edgeUs = edgeUs - CORRECTION_US;
   timescale.ntpSec = ntpSec;
   timescale.rateQ32 = rateQ32;
-  timescale.valid = haveRate;
+  timescale.valid = true;
   portEXIT_CRITICAL(&tsMux);
 }
 
@@ -295,43 +323,66 @@ void readGPSTime() {
 
   while (gpsSerial.available()) gps.encode(gpsSerial.read());
 
-  if (gps.time.isUpdated() && gps.time.isValid()) {
-    int currentSecond = gps.time.second();
-    
-    if (currentSecond == previousSecond) { 
-      // we've already seen a NMEA message for this second, don't process any more updates
-      return; 
-    }
-
-    previousSecond = currentSecond;
-
-    uint32_t delta = (uint32_t)nowUs - localPPS;
-    if (delta > 900000 || delta < 1000) { 
-      // "one-second" guard: GPS sentences usually arrive 200-500ms AFTER the PPS pulse.
-      // If microsecondsSincePulse is very large (e.g., > 900ms), we are likely looking at 
-      // an old PPS pulse from the PREVIOUS second. If it's very small (e.g., < 10ms), the
-      // PPS for the NEXT second might have just fired before we parsed the data for the
-      // current second. If we detect either of these situations, skip processing. This
-      // means we only process when in a reasonable time window from the PPS pulse.
-      return; 
-    }
-
-    static bool ledState = false;
-    digitalWrite(STATUS_LED_PIN, ledState = !ledState);
-
-    struct tm t = {0};
-    t.tm_year = gps.date.year() - 1900;
-    t.tm_mon  = gps.date.month() - 1;
-    t.tm_mday = gps.date.day();
-    t.tm_hour = gps.time.hour();
-    t.tm_min  = gps.time.minute();
-    t.tm_sec  = gps.time.second();
-    
-    time_t gpsSecs = mktime(&t);
-
-    // edge N happened delta us before nowUs (localPPS is the low 32 bits of its esp_timer time)
-    updateTimescale(gpsSecs + NTP_EPOCH_OFFSET, nowUs - delta);
+  // Only trigger on RMC ($GNRMC / $GPRMC), which carries date, time, and fix status ('A'/'V')
+  // atomically in one sentence — avoiding the midnight GGA-before-RMC day-behind race.
+  bool rmcUpdated = false;
+  bool rmcActive = false;
+  if (gnrmcStatus.isUpdated()) {
+    rmcUpdated = true;
+    rmcActive = (gnrmcStatus.value()[0] == 'A');
   }
+  if (gprmcStatus.isUpdated()) {
+    rmcUpdated = true;
+    rmcActive = rmcActive || (gprmcStatus.value()[0] == 'A');
+  }
+
+  if (!rmcUpdated || !rmcActive) {
+    return;
+  }
+
+  if (!gps.date.isValid() || !gps.time.isValid() || gps.date.year() < MIN_VALID_YEAR) {
+    return;
+  }
+
+  if (!gps.satellites.isValid() || gps.satellites.age() > 2500 || gps.satellites.value() < MIN_SATS) {
+    return;
+  }
+
+  int currentSecond = gps.time.second();
+  if (currentSecond == previousSecond) {
+    // we've already processed an RMC message for this second
+    return;
+  }
+  previousSecond = currentSecond;
+
+  uint32_t delta = (uint32_t)nowUs - localPPS;
+  if (delta > 900000 || delta < 1000) {
+    // "one-second" guard: GPS sentences usually arrive 50-500ms AFTER the PPS pulse.
+    // If delta is very large (> 900ms), we are likely looking at an old PPS pulse from
+    // the PREVIOUS second. If it's very small (< 1ms), the PPS for the NEXT second might
+    // have just fired before we parsed the data for the current second. Skip processing
+    // outside this window.
+    return;
+  }
+
+  static bool ledState = false;
+  digitalWrite(STATUS_LED_PIN, ledState = !ledState);
+
+  struct tm t = {0};
+  t.tm_year = gps.date.year() - 1900;
+  t.tm_mon  = gps.date.month() - 1;
+  t.tm_mday = gps.date.day();
+  t.tm_hour = gps.time.hour();
+  t.tm_min  = gps.time.minute();
+  t.tm_sec  = currentSecond;
+
+  time_t gpsSecs = mktime(&t);
+  if (gpsSecs < 0) {
+    return;
+  }
+
+  // edge N happened delta us before nowUs (localPPS is the low 32 bits of its esp_timer time)
+  updateTimescale(gpsSecs + NTP_EPOCH_OFFSET, nowUs - delta);
 }
 
 void gpsTask(void *p) { 

@@ -34,6 +34,10 @@ The build-time settings are `#define`s at the top of the file:
 | `NTP_PORT` | UDP 123 |
 | `HOLDOVER_MS` | How long (60 s) the server keeps reporting itself as synchronized after the last accepted GNSS sync (see [Request handling](#request-handling)) |
 | `MAX_PPM` | PPS edges whose spacing implies a clock error above this (100 ppm) are rejected as glitches (see [Sanity-check the edge](#6-sanity-check-the-edge)) |
+| `MAX_EDGE_JITTER_US` | Base tolerance (15 µs) for a PPS edge's residual against the rate-predicted spacing once locked |
+| `MAX_DRIFT_PPM` | Per-second tolerance (5 ppm) added to `MAX_EDGE_JITTER_US` to allow temperature drift across GNSS outages |
+| `MIN_SATS` | Minimum satellites in use (4, from GGA) required to accept a GNSS sync |
+| `MIN_VALID_YEAR` | Reject uninitialized/RTC-default GNSS dates before this year (2025) |
 | `RATE_SHIFT` | How strongly the frequency estimate is smoothed: it averages over about 2^`RATE_SHIFT` (16) syncs |
 | `NTP_PRECISION` | Reported clock precision in log2 seconds (`-20`, ≈ 0.95 µs, matching `esp_timer`'s 1 µs resolution) |
 | `ROOT_DISP_BASE_US` | Baseline root dispersion in µs when freshly synced (50 µs) |
@@ -98,13 +102,17 @@ int64_t  nowUs    = esp_timer_get_time();
 
 These are captured before the UART is drained, so a PPS edge that fires during parsing can't replace the edge for the second being decoded. The ISR stores only the low 32 bits of `esp_timer` (one word, so the write is atomic). `nowUs` is read alongside it so the edge's full 64-bit time can be rebuilt in step 5.
 
-### 2. Feed NMEA into TinyGPSPlus
+### 2. Feed NMEA into TinyGPSPlus and validate the fix
 
-All pending UART bytes go into `gps.encode()`. The rest of the function runs only when a new, valid time has just been decoded (`gps.time.isUpdated() && gps.time.isValid()`).
+All pending UART bytes go into `gps.encode()`. Two `TinyGPSCustom` watchers inspect field 2 (the `A`/`V` fix-status flag) of `$GNRMC` and `$GPRMC`. The rest of the function runs only when:
+
+- an RMC sentence (`$GNRMC` or `$GPRMC`) has just been decoded with status `'A'` (active fix), so date, time and fix status all come atomically from the same sentence;
+- `gps.date.isValid()`, `gps.time.isValid()` and `gps.date.year() >= MIN_VALID_YEAR` hold (preventing cold-start or RTC-default dates from being accepted);
+- `gps.satellites` (from GGA) is valid, fresh (`age() <= 2500` ms) and reports at least `MIN_SATS` (4) satellites in use.
 
 ### 3. Process each second only once
 
-The receiver sends several sentences per second that carry the time (e.g. RMC and GGA). `previousSecond` makes sure only the first one for a given second is used.
+Only RMC sentences trigger updates, and `previousSecond` guards against reprocessing the same second.
 
 ### 4. Line up the NMEA time with its PPS edge
 
@@ -134,10 +142,11 @@ The anchor is the pair (NTP second N, full `esp_timer` time of edge N = `nowUs �
 
 `updateTimescale()` compares the new anchor with the previous accepted one, which was `secs` seconds earlier. Over `secs` seconds, `esp_timer` should have advanced by `secs × 10⁶` µs, give or take the crystal's error. The difference, `gainUs`, is how far the timer ran ahead. The anchor is rejected if:
 
-- `secs ≤ 0`: the label went backwards or didn't move, for example a date a day behind at midnight; or
-- `|gainUs| > secs × MAX_PPM`: no real crystal is that far off, so either the PPS line glitched or the NMEA was paired with the wrong edge.
+- `secs ≤ 0`: the label went backwards or didn't move;
+- `|gainUs| > secs × MAX_PPM`: no real crystal is that far off, so either the PPS line glitched or the NMEA was paired with the wrong edge; or
+- once `haveRate` is established, `|gainUs − expectedGainUs| > MAX_EDGE_JITTER_US + secs × MAX_DRIFT_PPM`: the edge deviated too far from the rate-predicted spacing (e.g., a delayed PPS ISR), while still allowing up to `MAX_DRIFT_PPM` of temperature drift across longer GNSS outages.
 
-A rejected anchor isn't published, so replies keep being computed from the previous one. If three anchors in a row are rejected, the previous anchor is assumed to be the bad one. The next anchor is then accepted without a rate update.
+A rejected anchor isn't published, so replies keep being computed from the previous one. If three anchors in a row are rejected, the previous anchor (or learned rate) is assumed to be the bad one: `prevEdgeUs`/`prevSec` are re-seeded to the new candidate and `haveRate` is reset to `false`, **without publishing** to `timescale`. The following sync must corroborate the new candidate before clients ever see it.
 
 ### 7. Learn the frequency
 
@@ -260,11 +269,7 @@ These come from reading the code and a host simulation of the timescale maths, n
 
 - **The ESP32 system clock is never set.** `time()`/`gettimeofday()` report time since boot. Nothing in the sketch uses them, but anything added later that does would get the wrong time.
 - **1 µs resolution.** `esp_timer` counts whole microseconds, so served timestamps are quantized to 1 µs.
-- **Comment and code disagree on the lower guard.** The comment in the delta guard says "< 10ms", but the code uses `delta < 1000` (1 ms).
-- **Midnight date.** The date comes from the most recent RMC sentence. If a GGA sentence for 00:00:00 is decoded before the RMC for the new day, the date can be a day behind. That anchor goes backwards, so the sanity check in step 6 rejects it. `gps.date.isValid()` is still not checked.
-- **Three bad edges in a row are trusted.** The "three rejects means the previous anchor was wrong" rule recovers from a single bad anchor. A burst of three or more glitched edges would be accepted as a new anchor, and served until the next good edge replaces it a second later.
-- **PPS interrupt latency.** The PPS edge is timestamped by a level-1 Arduino `attachInterrupt` handler, which other level-1 interrupts on the same core (such as the GPS UART) can delay. A delayed edge lands within `MAX_PPM`, so it isn't rejected; it shifts the anchor (and slightly the rate) for one second.
-- **No fix-quality checks.** Any valid NMEA time paired with a PPS edge is trusted. Satellite count and fix status are not checked. The holdover limit only reacts when syncs *stop*, not when they come from a poor fix.
+- **PPS interrupt latency.** The PPS edge is timestamped by a level-1 Arduino `attachInterrupt` handler, which other level-1 interrupts on the same core (such as the GPS UART or EMAC) can delay. Delays larger than `MAX_EDGE_JITTER_US + MAX_DRIFT_PPM` (20 µs on a 1 s interval) are rejected once locked, but smaller delays still shift the anchor (and slightly the rate) for one second.
 - **Holdover is a fixed timeout.** The server is reported as synchronized (LI=0, stratum 1) for the full `HOLDOVER_MS` after the last sync, however much the clock actually drifts in that time, although `rootDispersion` grows continuously at `ROOT_DISP_PPM` so clients can see accuracy degrading.
 - **Hard-coded OTA password.** The OTA password (`uploadota`) is in the source.
 - **No watchdog** (listed as a TODO in the README).
