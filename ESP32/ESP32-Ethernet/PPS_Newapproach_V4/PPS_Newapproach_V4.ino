@@ -10,7 +10,6 @@
 #include <freertos/task.h>
 #include <lwip/tcpip.h>
 #include <ArduinoOTA.h>
-#include <ESPmDNS.h>
 
 // --- CONFIGURATION ---
 // this code assumes that we're always using a WT32-ETH01 module
@@ -25,7 +24,6 @@
 #define ETH_MDIO_PIN     18
 #define ETH_TYPE         ETH_PHY_LAN8720
 #define ETH_CLK_MODE     ETH_CLOCK_GPIO0_IN
-#define STATUS_LED_PIN   33           // TODO - there isn't a status PIN on the board so just map to GPIO33 for now
 
 // Settings
 #define GPS_BAUD         38400        // for a QUESCAN M10050 M10 GNNS receiver in default configuration (38400 baud, 1hz PPS)
@@ -52,7 +50,6 @@ HardwareSerial gpsSerial(1);
 // MCPWM hardware capture state: channel 0 latches PPS rising edges in hardware at 80 MHz APB
 // (12.5 ns, zero ISR latency jitter); channel 1 is software-triggered to correlate MCPWM ticks
 // with esp_timer's microsecond timebase.
-mcpwm_cap_timer_handle_t   ppsCapTimer = NULL;
 mcpwm_cap_channel_handle_t ppsCapChan  = NULL;
 mcpwm_cap_channel_handle_t softCapChan = NULL;
 uint32_t capResHz = 80000000;          // actual MCPWM capture tick rate (queried at init)
@@ -76,9 +73,6 @@ typedef struct {
 } timescale_t;
 timescale_t timescale = {0, 0, 0, false};
 portMUX_TYPE tsMux = portMUX_INITIALIZER_UNLOCKED;
-
-// Raw LwIP Control Block
-struct udp_pcb *ntp_pcb;
 
 // ntp packet
 typedef struct {
@@ -246,6 +240,7 @@ void onNtpPacket(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t
 
 // --- INIT ---
 void initPpsCapture() {
+  mcpwm_cap_timer_handle_t ppsCapTimer = NULL;
   mcpwm_capture_timer_config_t timerCfg = {};
   timerCfg.group_id = 0;
   timerCfg.clk_src = MCPWM_CAPTURE_CLK_SRC_DEFAULT;
@@ -398,8 +393,8 @@ void initRawNTP() {
  // CRITICAL: Lock the TCP/IP core before calling Raw API functions
   LOCK_TCPIP_CORE();
   
-   // Create a new UDP Control Block
-  ntp_pcb = udp_new();
+  // Create a new UDP Control Block
+  struct udp_pcb *ntp_pcb = udp_new();
   if (!ntp_pcb) { 
     fatalError("Could not create UDP PCB");
   }
@@ -519,7 +514,6 @@ void readGPSTime() {
     localHavePPS = havePPSCap;
   }
   int64_t preDrainUs = esp_timer_get_time();
-  static int previousSecond = -1;
 
   while (gpsSerial.available()) gps.encode(gpsSerial.read());
 
@@ -548,13 +542,6 @@ void readGPSTime() {
     return;
   }
 
-  int currentSecond = gps.time.second();
-  if (currentSecond == previousSecond) {
-    // we've already processed an RMC message for this second
-    return;
-  }
-  previousSecond = currentSecond;
-
   uint32_t preDelta = (uint32_t)preDrainUs - localPPSRoughUs;
   if (preDelta > 900000 || preDelta < 1000) {
     // "one-second" guard: GPS sentences usually arrive 50-500ms AFTER the PPS pulse.
@@ -580,16 +567,13 @@ void readGPSTime() {
     return;
   }
 
-  static bool ledState = false;
-  digitalWrite(STATUS_LED_PIN, ledState = !ledState);
-
   struct tm t = {0};
   t.tm_year = gps.date.year() - 1900;
   t.tm_mon  = gps.date.month() - 1;
   t.tm_mday = gps.date.day();
   t.tm_hour = gps.time.hour();
   t.tm_min  = gps.time.minute();
-  t.tm_sec  = currentSecond;
+  t.tm_sec  = gps.time.second();
 
   time_t gpsSecs = mktime(&t);
   if (gpsSecs < 0) {
@@ -620,7 +604,6 @@ void setup() {
   delay(10000);
 
   Serial.println("----- start: gps init -----");
-  pinMode(STATUS_LED_PIN, OUTPUT);
   gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   initUbloxM10();
   initPpsCapture();

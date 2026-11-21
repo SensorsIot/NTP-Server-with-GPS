@@ -9,7 +9,7 @@ The sketch is built around two goals:
 1. **Low response latency.** Take the NTP receive timestamp as soon as the packet reaches the IP stack, and send the reply straight from there.
 2. **Low jitter.** Serve time from the ESP32's free-running microsecond timer (`esp_timer`), anchored at the latest PPS edge and corrected for the timer's measured frequency error. The ESP32 system clock (`gettimeofday`, `adjtime`) isn't used at all.
 
-Everything else (OTA updates, the status LED, error recovery) supports those two goals.
+Everything else (OTA updates, error recovery) supports those two goals.
 
 ## Hardware assumptions
 
@@ -22,7 +22,6 @@ The code assumes one hardware setup and has no runtime configuration:
 | GPS UART RX / TX | GPIO15 / GPIO4 (UART1) |
 | PPS input | GPIO2, rising edge |
 | PHY power / MDC / MDIO | GPIO16 / GPIO23 / GPIO18, PHY address 1 |
-| Status LED | GPIO33 (the board has no LED; this is a placeholder) |
 
 The build-time settings are `#define`s at the top of the file:
 
@@ -33,7 +32,7 @@ The build-time settings are `#define`s at the top of the file:
 | `NTP_EPOCH_OFFSET` | Seconds between 1900-01-01 (NTP epoch) and 1970-01-01 (Unix epoch) |
 | `NTP_PORT` | UDP 123 |
 | `HOLDOVER_MS` | How long (60 s) the server keeps reporting itself as synchronized after the last accepted GNSS sync (see [Request handling](#request-handling)) |
-| `MAX_PPM` | PPS edges whose spacing implies a clock error above this (100 ppm) are rejected as glitches (see [Sanity-check the edge](#6-sanity-check-the-edge)) |
+| `MAX_PPM` | PPS edges whose spacing implies a clock error above this (100 ppm) are rejected as glitches (see [Sanity-check the edge](#5-sanity-check-the-edge)) |
 | `MAX_EDGE_JITTER_US` | Base tolerance (15 µs) for a PPS edge's residual against the rate-predicted spacing once locked |
 | `MAX_DRIFT_PPM` | Per-second tolerance (5 ppm) added to `MAX_EDGE_JITTER_US` to allow temperature drift across GNSS outages |
 | `MIN_SATS` | Minimum satellites in use (4, from GGA) required to accept a GNSS sync |
@@ -105,11 +104,7 @@ All pending UART bytes go into `gps.encode()`. Two `TinyGPSCustom` watchers insp
 - `gps.date.isValid()`, `gps.time.isValid()` and `gps.date.year() >= MIN_VALID_YEAR` hold (preventing cold-start or RTC-default dates from being accepted);
 - `gps.satellites` (from GGA) is valid, fresh (`age() <= 2500` ms) and reports at least `MIN_SATS` (4) satellites in use.
 
-### 3. Process each second only once
-
-Only RMC sentences trigger updates, and `previousSecond` guards against reprocessing the same second.
-
-### 4. Line up the NMEA time with its PPS edge
+### 3. Line up the NMEA time with its PPS edge
 
 The design depends on how the receiver behaves: the PPS edge marks the exact start of a UTC second, and the NMEA sentences that name that second arrive a few hundred milliseconds later.
 
@@ -127,13 +122,13 @@ Once a valid RMC sentence is decoded, `preDelta = (uint32_t)preDrainUs - localPP
 - `delta > 900 ms`: the PPS stamp is probably from the previous second (a PPS edge was missed, or the NMEA arrived very late).
 - `delta < 1 ms`: the PPS for second N+1 probably fired before the NMEA for second N was parsed, so the pairing would be wrong by one second.
 
-### 5. Build the anchor
+### 4. Build the anchor
 
-The status LED toggles, so it blinks at 0.5 Hz while syncs are being paired. The GPS date and time go into a `struct tm` and `mktime()` converts it to Unix seconds. This works because the ESP32's default time zone is UTC, so `mktime` effectively acts as `timegm`.
+The GPS date and time go into a `struct tm` and `mktime()` converts it to Unix seconds. This works because the ESP32's default time zone is UTC, so `mktime` effectively acts as `timegm`.
 
-The anchor is the pair (NTP second N, full `esp_timer` time of edge N = `nowUs − delta`), passed to `updateTimescale()`. Parsing time doesn't matter here: the edge was timestamped by the ISR, and the parsing only labels it.
+The anchor is the pair (NTP second N, full `esp_timer` time of edge N = `nowUs − deltaUs`), passed to `updateTimescale()`. Parsing time doesn't matter here: the edge was latched in hardware by MCPWM, and parsing only labels it.
 
-### 6. Sanity-check the edge
+### 5. Sanity-check the edge
 
 `updateTimescale()` compares the new anchor with the previous accepted one, which was `secs` seconds earlier. Over `secs` seconds, `esp_timer` should have advanced by `secs × 10⁶` µs, give or take the crystal's error. The difference, `gainUs`, is how far the timer ran ahead. The anchor is rejected if:
 
@@ -143,7 +138,7 @@ The anchor is the pair (NTP second N, full `esp_timer` time of edge N = `nowUs �
 
 A rejected anchor isn't published, so replies keep being computed from the previous one. If three anchors in a row are rejected, the previous anchor (or learned rate) is assumed to be the bad one: `prevEdgeUs`/`prevSec` are re-seeded to the new candidate and `haveRate` is reset to `false`, **without publishing** to `timescale`. The following sync must corroborate the new candidate before clients ever see it.
 
-### 7. Learn the frequency
+### 6. Learn the frequency
 
 For each accepted anchor, the frequency error over the interval is `gainUs / (secs × 10⁶)`, stored as a fraction × 2³² (`rateQ32`; 1 ppm ≈ 4295). The first sample is taken as is, and later ones go into an exponential average:
 
@@ -153,7 +148,7 @@ rateQ32 += (sample − rateQ32) >> RATE_SHIFT;
 
 A single 1 s interval is only accurate to the ISR jitter (about 1–2 ppm). Averaging over about 16 syncs brings that down to a fraction of a ppm, while still following temperature drift within tens of seconds. After a GNSS outage, the first interval spans the whole gap, so that sample is very accurate.
 
-### 8. Publish
+### 7. Publish
 
 `edgeUs − CORRECTION_US`, `ntpSec`, `rateQ32` and `valid` are written to `timescale` under `portENTER_CRITICAL(&tsMux)`. `valid` stays false until the first accepted interval, that is, until two syncs agree. This means a glitched first edge is never served.
 
