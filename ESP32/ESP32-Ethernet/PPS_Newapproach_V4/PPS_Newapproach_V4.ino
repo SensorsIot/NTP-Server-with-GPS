@@ -31,8 +31,11 @@
 #define NTP_EPOCH_OFFSET 2208988800UL
 #define NTP_PORT         123
 #define HOLDOVER_MS      60000        // report unsynchronised (LI=3) if no GNSS sync for this long
-#define MAX_PPM          100          // reject PPS edges whose spacing implies a clock error larger than this
-#define RATE_SHIFT       4            // frequency estimate averages over about 2^RATE_SHIFT syncs
+#define MAX_PPM            100        // reject PPS edges whose spacing implies a clock error larger than this
+#define RATE_SHIFT         4          // frequency estimate averages over about 2^RATE_SHIFT syncs
+#define NTP_PRECISION      (-20)      // log2 seconds (~0.95 us), matching esp_timer's 1 us resolution
+#define ROOT_DISP_BASE_US  50         // baseline root dispersion in us when freshly synced
+#define ROOT_DISP_PPM      15         // holdover dispersion growth rate in ppm (RFC 5905 PHI)
 
 // --- GLOBALS ---
 TinyGPSPlus gps;
@@ -58,7 +61,7 @@ typedef struct {
   uint8_t li_vn_mode; 
   uint8_t stratum; 
   uint8_t poll; 
-  uint8_t precision;
+  int8_t  precision;
   uint32_t rootDelay; 
   uint32_t rootDispersion; 
   uint32_t refId;
@@ -84,6 +87,17 @@ void fatalError(const char* msg) {
 // usec * 2^32 / 10^6 without floating point (the ESP32 FPU is single precision, so double maths is emulated)
 static inline uint32_t usecToNtpFrac(uint32_t usec) {
   return (uint32_t)(((uint64_t)usec * 281474977ULL) >> 16);
+}
+
+// root dispersion in NTP short format (16.16 unsigned fixed-point seconds, 1 LSB = 1/65536 s ~ 15.26 us)
+static inline uint32_t calcRootDispersion(int64_t ageUs) {
+  static constexpr uint64_t BASE_SHORT = ((uint64_t)ROOT_DISP_BASE_US * 65536ULL + 999999ULL) / 1000000ULL;
+  static constexpr uint64_t RATE_Q32   = ((uint64_t)ROOT_DISP_PPM * 65536ULL * (1ULL << 32) + 999999999999ULL) / 1000000000000ULL;
+  uint64_t disp = BASE_SHORT;
+  if (ageUs > 0) {
+    disp += ((uint64_t)ageUs * RATE_Q32 + (1ULL << 31)) >> 32;
+  }
+  return (disp > 0xFFFFFFFFULL) ? 0xFFFFFFFFUL : (uint32_t)disp;
 }
 
 // convert an esp_timer reading into NTP seconds and fraction using a copy of the timescale
@@ -114,43 +128,54 @@ void onNtpPacket(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t
   ts = timescale;
   portEXIT_CRITICAL(&tsMux);
 
-  // 2. Validate Packet Size (NTP is 48 bytes), only answer client requests (mode 3) so we
-  // never reply to another server's reply, and stay silent until the timescale has been set
-  // from GNSS so we never serve the boot time.
-  ntp_packet_t *pkt = (ntp_packet_t *)p->payload;
-  if (ts.valid && p->tot_len >= sizeof(ntp_packet_t) && (pkt->li_vn_mode & 0x07) == 3) {
-    // 3. Update Packet in Place
-    // LI=0 while GNSS is fresh, LI=3 (unsynchronised) once we've been in holdover too long.
-    // VN is copied from the request, mode 4 = server.
-    bool stale = (rxUs - ts.edgeUs) > (int64_t)HOLDOVER_MS * 1000;
-    uint8_t li = stale ? 3 : 0;
-    uint8_t vn = (pkt->li_vn_mode >> 3) & 0x07;
-    pkt->li_vn_mode = (li << 6) | (vn << 3) | 4;
-    pkt->stratum = stale ? 16 : 1;   // 16 = unsynchronised
-    pkt->refId = htonl(0x47505300); // "GPS"
-    
-    // Reference time = the PPS edge the timescale is anchored to
-    pkt->refTm_s = htonl(ts.ntpSec);
-    pkt->refTm_f = 0;
+  // 2. Validate Packet Size (NTP is 48 bytes, contiguous in the first pbuf), only answer
+  // client requests (mode 3) so we never reply to another server's reply, and stay silent
+  // until the timescale has been set from GNSS so we never serve the boot time.
+  if (ts.valid && p->len >= sizeof(ntp_packet_t)) {
+    ntp_packet_t *pkt = (ntp_packet_t *)p->payload;
+    if ((pkt->li_vn_mode & 0x07) == 3) {
+      // Trim any trailing bytes (e.g. client extension fields / MAC) so we always send a 48-byte reply
+      if (p->tot_len > sizeof(ntp_packet_t)) {
+        pbuf_realloc(p, sizeof(ntp_packet_t));
+      }
 
-    // Originate = Client's Transmit Time
-    pkt->origTm_s = pkt->txTm_s;
-    pkt->origTm_f = pkt->txTm_f;
+      // 3. Update Packet in Place
+      // LI=0 while GNSS is fresh, LI=3 (unsynchronised) once we've been in holdover too long.
+      // VN and poll are copied from the request, mode 4 = server.
+      int64_t ageUs = rxUs - ts.edgeUs;
+      bool stale = ageUs > (int64_t)HOLDOVER_MS * 1000;
+      uint8_t li = stale ? 3 : 0;
+      uint8_t vn = (pkt->li_vn_mode >> 3) & 0x07;
+      pkt->li_vn_mode = (li << 6) | (vn << 3) | 4;
+      pkt->stratum = stale ? 16 : 1;   // 16 = unsynchronised
+      pkt->precision = NTP_PRECISION;
+      pkt->rootDelay = 0;
+      pkt->rootDispersion = htonl(calcRootDispersion(ageUs));
+      pkt->refId = htonl(0x47505300); // "GPS"
+      
+      // Reference time = the PPS edge the timescale is anchored to
+      pkt->refTm_s = htonl(ts.ntpSec);
+      pkt->refTm_f = 0;
 
-    // RX = the timestamp taken on arrival
-    uint32_t s, f;
-    toNtp(ts, rxUs, s, f);
-    pkt->rxTm_s = htonl(s);
-    pkt->rxTm_f = htonl(f);
+      // Originate = Client's Transmit Time
+      pkt->origTm_s = pkt->txTm_s;
+      pkt->origTm_f = pkt->txTm_f;
 
-    // 4. TX = read the clock again as late as possible so our processing time is
-    // reported to the client instead of being counted as network delay
-    toNtp(ts, esp_timer_get_time(), s, f);
-    pkt->txTm_s = htonl(s);
-    pkt->txTm_f = htonl(f);
+      // RX = the timestamp taken on arrival
+      uint32_t s, f;
+      toNtp(ts, rxUs, s, f);
+      pkt->rxTm_s = htonl(s);
+      pkt->rxTm_f = htonl(f);
 
-    // 5. Send Response (Reflect the buffer back)
-    udp_sendto(pcb, p, addr, port);
+      // 4. TX = read the clock again as late as possible so our processing time is
+      // reported to the client instead of being counted as network delay
+      toNtp(ts, esp_timer_get_time(), s, f);
+      pkt->txTm_s = htonl(s);
+      pkt->txTm_f = htonl(f);
+
+      // 5. Send Response (Reflect the buffer back)
+      udp_sendto(pcb, p, addr, port);
+    }
   }
 
   // 6. Free the buffer (LwIP requires this)

@@ -35,6 +35,9 @@ The build-time settings are `#define`s at the top of the file:
 | `HOLDOVER_MS` | How long (60 s) the server keeps reporting itself as synchronized after the last accepted GNSS sync (see [Request handling](#request-handling)) |
 | `MAX_PPM` | PPS edges whose spacing implies a clock error above this (100 ppm) are rejected as glitches (see [Sanity-check the edge](#6-sanity-check-the-edge)) |
 | `RATE_SHIFT` | How strongly the frequency estimate is smoothed: it averages over about 2^`RATE_SHIFT` (16) syncs |
+| `NTP_PRECISION` | Reported clock precision in log2 seconds (`-20`, ≈ 0.95 µs, matching `esp_timer`'s 1 µs resolution) |
+| `ROOT_DISP_BASE_US` | Baseline root dispersion in µs when freshly synced (50 µs) |
+| `ROOT_DISP_PPM` | Rate at which reported root dispersion grows with anchor age (15 ppm, matching RFC 5905 `PHI`) |
 
 ## Architecture overview
 
@@ -172,15 +175,21 @@ UNLOCK_TCPIP_CORE();
 2. **Copy the timescale.** The callback copies `timescale` under `tsMux`. The spinlock is held only for the copy of a few words.
 3. **Decide whether to answer.** The packet is dropped without a reply unless all of these hold:
    - `ts.valid` is true, so the server never hands out the boot time or a glitched edge;
-   - it is at least 48 bytes (`sizeof(ntp_packet_t)`);
+   - the first `pbuf` segment is at least 48 bytes (`p->len >= sizeof(ntp_packet_t)`), so the NTP header is contiguous in memory;
    - its mode is 3 (client), so the server never answers another server's reply.
-4. **Check freshness.** The reply counts as *stale* when the anchor is more than `HOLDOVER_MS` old (`rxUs − ts.edgeUs`), that is, when no GNSS sync has been accepted for more than 60 s.
+
+   If `p->tot_len` is larger than 48 bytes (e.g. client extension fields or a MAC), `pbuf_realloc()` trims the packet to 48 bytes so stale trailing bytes are not echoed back.
+4. **Check freshness.** The reply counts as *stale* when the anchor is more than `HOLDOVER_MS` old (`ageUs = rxUs − ts.edgeUs`), that is, when no GNSS sync has been accepted for more than 60 s.
 5. **Edit the packet in place (zero copy).** The received `pbuf` payload is cast to `ntp_packet_t` and overwritten:
 
    | Field | Value |
    | --- | --- |
    | `li_vn_mode` | Leap indicator 0 when fresh or 3 (unsynchronized) when stale, version copied from the request, mode 4 (server) |
    | `stratum` | 1 (primary reference) when fresh, 16 (unsynchronized) when stale |
+   | `poll` | echoed from the request (per RFC 5905) |
+   | `precision` | `NTP_PRECISION` (−20, ≈ 0.95 µs) |
+   | `rootDelay` | 0 (primary reference) |
+   | `rootDispersion` | NTP short format (16.16 s): `ROOT_DISP_BASE_US` plus `ageUs × ROOT_DISP_PPM`, computed in integer maths by `calcRootDispersion()` |
    | `refId` | `"GPS\0"` |
    | `refTm` | the anchor second, `ts.ntpSec`, with a zero fraction (the PPS edge marks the start of that second) |
    | `origTm` | the client's transmit timestamp, copied from `txTm` |
@@ -251,13 +260,12 @@ These come from reading the code and a host simulation of the timescale maths, n
 
 - **The ESP32 system clock is never set.** `time()`/`gettimeofday()` report time since boot. Nothing in the sketch uses them, but anything added later that does would get the wrong time.
 - **1 µs resolution.** `esp_timer` counts whole microseconds, so served timestamps are quantized to 1 µs.
-- **Some header fields are echoed back from the request.** `poll`, `precision`, `rootDelay` and `rootDispersion` are left as the client sent them instead of being set by the server. Root dispersion in particular doesn't grow during holdover, so for the first 60 s after GNSS is lost, clients can't see that the clock is getting less accurate.
 - **Comment and code disagree on the lower guard.** The comment in the delta guard says "< 10ms", but the code uses `delta < 1000` (1 ms).
 - **Midnight date.** The date comes from the most recent RMC sentence. If a GGA sentence for 00:00:00 is decoded before the RMC for the new day, the date can be a day behind. That anchor goes backwards, so the sanity check in step 6 rejects it. `gps.date.isValid()` is still not checked.
 - **Three bad edges in a row are trusted.** The "three rejects means the previous anchor was wrong" rule recovers from a single bad anchor. A burst of three or more glitched edges would be accepted as a new anchor, and served until the next good edge replaces it a second later.
 - **PPS interrupt latency.** The PPS edge is timestamped by a level-1 Arduino `attachInterrupt` handler, which other level-1 interrupts on the same core (such as the GPS UART) can delay. A delayed edge lands within `MAX_PPM`, so it isn't rejected; it shifts the anchor (and slightly the rate) for one second.
 - **No fix-quality checks.** Any valid NMEA time paired with a PPS edge is trusted. Satellite count and fix status are not checked. The holdover limit only reacts when syncs *stop*, not when they come from a poor fix.
-- **Holdover is a fixed timeout.** The server is reported as synchronized for the full `HOLDOVER_MS` after the last sync, however much the clock actually drifts in that time.
+- **Holdover is a fixed timeout.** The server is reported as synchronized (LI=0, stratum 1) for the full `HOLDOVER_MS` after the last sync, however much the clock actually drifts in that time, although `rootDispersion` grows continuously at `ROOT_DISP_PPM` so clients can see accuracy degrading.
 - **Hard-coded OTA password.** The OTA password (`uploadota`) is in the source.
 - **No watchdog** (listed as a TODO in the README).
 - **Unused file.** `credentials.h` sits in the sketch folder but is not included.
